@@ -82,14 +82,6 @@ def health():
     return jsonify({"ok": True})
 
 # -------------------------
-# TEMP: DB init route (REMOVE/SECURE after setup)
-# -------------------------
-@app.get("/admin/init-db")
-def init_db():
-    db.create_all()
-    return jsonify({"ok": True, "message": "Database tables created."})
-
-# -------------------------
 # Routes: Auth
 # -------------------------
 @app.post("/auth/register")
@@ -211,3 +203,4 @@ with app.app_context():
 # -------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+
