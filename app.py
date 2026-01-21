@@ -1,5 +1,4 @@
 import os
-import re
 import secrets
 from datetime import datetime, timezone
 
@@ -18,18 +17,33 @@ from flask_limiter.util import get_remote_address
 # -------------------------
 app = Flask(__name__)
 
-# CORS: allow ONLY your frontend origins
+# ✅ CORS (FIXED): allow your frontend + allow X-API-Key + allow preflight OPTIONS
 CORS(
     app,
     resources={r"/*": {"origins": ["https://676trades.org", "https://www.676trades.org"]}},
+    methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-API-Key"],
+    expose_headers=["Content-Type"],
+    max_age=86400,
 )
 
-# Rate limiting: global defaults
+# Rate limiting
 limiter = Limiter(
     get_remote_address,
     app=app,
     default_limits=["60 per minute"],
 )
+
+# ✅ IMPORTANT: do NOT rate limit OPTIONS preflight (or browsers will fail)
+@limiter.request_filter
+def _skip_rate_limit_for_options():
+    return request.method == "OPTIONS"
+
+# ✅ Handle preflight quickly (some setups still need this)
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        return ("", 204)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///db.sqlite3")
 
@@ -45,38 +59,6 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
 
-# -------------------------
-# Pair list validation
-# -------------------------
-SYMBOL_RE = re.compile(r"^[A-Z0-9._]{3,15}$")
-
-
-def normalize_pairs(value: str) -> str:
-    """
-    Accepts:
-      "XAUUSD"
-      "XAUUSD,EURUSD,GBPUSD,USDJPY"
-      "xauusd, eurusd"
-    Returns a comma-joined, uppercased, de-duped string.
-    """
-    items = [p.strip().upper() for p in (value or "").split(",") if p.strip()]
-    if not items:
-        raise ValueError("pair is required")
-
-    out = []
-    seen = set()
-    for s in items:
-        if not SYMBOL_RE.match(s):
-            raise ValueError(f"invalid symbol: {s}")
-        if s not in seen:
-            seen.add(s)
-            out.append(s)
-
-    joined = ",".join(out)
-    if len(joined) > 255:
-        raise ValueError("too many pairs (limit reached)")
-    return joined
-
 
 # -------------------------
 # Models
@@ -89,24 +71,25 @@ class User(db.Model):
     email = db.Column(db.String(255), unique=True, nullable=False, index=True)
     password_hash = db.Column(db.String(255), nullable=False)
 
+    # This is YOUR backend user key (not broker key)
     api_key = db.Column(db.String(64), unique=True, nullable=False, index=True)
 
     enabled = db.Column(db.Boolean, default=False, nullable=False)
 
-    # IMPORTANT: allow multi-pair comma list
-    pair = db.Column(db.String(255), default="XAUUSD", nullable=False)
+    # ✅ allow multi-pairs: store as CSV like "XAUUSD,EURUSD,GBPUSD,USDJPY"
+    pairs = db.Column(db.String(255), default="XAUUSD", nullable=False)
 
     lot_size = db.Column(db.Float, default=0.01, nullable=False)
 
-    # --- SL/TP settings ---
-    sl_mode = db.Column(db.String(20), default="dynamic", nullable=False)  # dynamic | fixed
-    tp_mode = db.Column(db.String(20), default="rr", nullable=False)      # rr | pattern_mult | fixed
+    # SL/TP settings
+    sl_mode = db.Column(db.String(20), default="dynamic", nullable=False)          # dynamic | fixed
+    tp_mode = db.Column(db.String(20), default="rr", nullable=False)              # rr | pattern_mult | fixed
 
-    min_pips = db.Column(db.Integer, default=50, nullable=False)          # floor for SL & TP
-    sl_buffer_pips = db.Column(db.Integer, default=5, nullable=False)     # beyond pattern high/low
+    min_pips = db.Column(db.Integer, default=50, nullable=False)
+    sl_buffer_pips = db.Column(db.Integer, default=5, nullable=False)
 
-    rr = db.Column(db.Float, default=1.0, nullable=False)                 # TP = risk * rr
-    pattern_tp_mult = db.Column(db.Float, default=1.5, nullable=False)    # TP = pattern_range * mult
+    rr = db.Column(db.Float, default=1.0, nullable=False)
+    pattern_tp_mult = db.Column(db.Float, default=1.5, nullable=False)
 
     fixed_sl_pips = db.Column(db.Integer, default=50, nullable=False)
     fixed_tp_pips = db.Column(db.Integer, default=50, nullable=False)
@@ -169,6 +152,54 @@ def safe_int(v, default=None):
         return default
 
 
+def normalize_pairs(raw: str):
+    """
+    Accept:
+      "XAUUSD"
+      "XAUUSD,EURUSD,GBPUSD,USDJPY"
+      "xauusd eurusd gbpusd usdjpy"
+    Store as CSV uppercase with no spaces.
+    """
+    if raw is None:
+        return None
+
+    s = str(raw).strip().upper()
+    if not s:
+        return None
+
+    # split by comma or whitespace
+    parts = []
+    for chunk in s.replace(" ", ",").split(","):
+        chunk = chunk.strip().upper()
+        if not chunk:
+            continue
+        parts.append(chunk)
+
+    # basic validation per symbol token
+    cleaned = []
+    for p in parts:
+        if len(p) < 3 or len(p) > 12:
+            return None
+        # keep only A-Z 0-9 . _ (optional)
+        for ch in p:
+            if not (("A" <= ch <= "Z") or ("0" <= ch <= "9") or ch in "._"):
+                return None
+        cleaned.append(p)
+
+    if not cleaned:
+        return None
+
+    # unique while preserving order
+    seen = set()
+    uniq = []
+    for p in cleaned:
+        if p not in seen:
+            uniq.append(p)
+            seen.add(p)
+
+    return ",".join(uniq)
+
+
 # -------------------------
 # Routes: Health
 # -------------------------
@@ -202,7 +233,7 @@ def register():
         password_hash=generate_password_hash(password),
         api_key=api_key,
         enabled=False,
-        pair="XAUUSD",
+        pairs="XAUUSD",
         lot_size=0.01,
     )
 
@@ -260,7 +291,11 @@ def status():
     return jsonify({
         "ok": True,
         "enabled": bool(user.enabled),
-        "pair": user.pair,
+
+        # Backward compatible fields:
+        "pair": (user.pairs.split(",")[0] if user.pairs else "XAUUSD"),
+        "pairs": user.pairs,
+
         "lot_size": float(user.lot_size),
 
         "sl_mode": user.sl_mode,
@@ -302,12 +337,19 @@ def settings():
 
     data = request.get_json(silent=True) or {}
 
-    # basic
-    if "pair" in data:
-        try:
-            user.pair = normalize_pairs(str(data["pair"]))
-        except ValueError as e:
-            return json_error(str(e), 400)
+    # ----- basic -----
+    # accept "pairs" preferred, or "pair" single for backwards compatibility
+    if "pairs" in data:
+        normalized = normalize_pairs(data.get("pairs"))
+        if not normalized:
+            return json_error("pairs looks invalid (use e.g. XAUUSD,EURUSD,GBPUSD,USDJPY)", 400)
+        user.pairs = normalized
+
+    if "pair" in data and "pairs" not in data:
+        normalized = normalize_pairs(data.get("pair"))
+        if not normalized:
+            return json_error("pair looks invalid", 400)
+        user.pairs = normalized
 
     if "lot_size" in data:
         lot = safe_float(data["lot_size"])
@@ -317,7 +359,7 @@ def settings():
             return json_error("lot_size out of range", 400)
         user.lot_size = lot
 
-    # sl/tp settings
+    # ----- sl/tp -----
     if "sl_mode" in data:
         sl_mode = str(data["sl_mode"]).strip().lower()
         if sl_mode not in ("dynamic", "fixed"):
@@ -330,7 +372,6 @@ def settings():
             return json_error("tp_mode must be rr, pattern_mult, or fixed", 400)
         user.tp_mode = tp_mode
 
-    # ints/floats with bounds
     if "min_pips" in data:
         v = safe_int(data["min_pips"])
         if v is None or v < 1 or v > 5000:
@@ -368,7 +409,7 @@ def settings():
         user.fixed_tp_pips = v
 
     db.session.commit()
-    return status()  # return full settings
+    return status()
 
 
 # -------------------------
@@ -388,15 +429,11 @@ def post_trade():
     if not symbol or side not in ("BUY", "SELL"):
         return json_error("symbol and side (BUY/SELL) required", 400)
 
-    volume = safe_float(data.get("volume"), 0.0)
-    if volume is None:
-        volume = 0.0
-
     t = Trade(
         user_id=user.id,
         symbol=symbol,
         side=side,
-        volume=float(volume),
+        volume=safe_float(data.get("volume"), 0.0) or 0.0,
         entry=safe_float(data.get("entry")),
         sl=safe_float(data.get("sl")),
         tp=safe_float(data.get("tp")),
