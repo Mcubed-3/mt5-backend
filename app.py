@@ -32,7 +32,7 @@ limiter = Limiter(
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///db.sqlite3")
 
-# Normalize and force psycopg v3 driver
+# Normalize Postgres URLs and force psycopg v3
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -128,38 +128,26 @@ def register():
         db.session.rollback()
         return json_error("Email already registered", 409)
 
-    # Return API key once on register (store it securely!)
     return jsonify({"ok": True, "message": "Registered", "api_key": api_key})
 
 
-@app.post("/api/v1/toggle")
-@limiter.limit("60 per minute")
-def toggle():
-    user, err = require_api_key()
-    if err:
-        return err
-
+@app.post("/auth/login")
+@limiter.limit("30 per hour")
+def login():
     data = request.get_json(silent=True) or {}
-    enabled = data.get("enabled", None)
+    email = (data.get("email") or "").strip().lower()
+    password = (data.get("password") or "").strip()
 
-    # If UI sends enabled explicitly, use it
-    if enabled is not None:
-        user.enabled = bool(enabled)
-    else:
-        # fallback: old behavior (flip)
-        user.enabled = not user.enabled
+    user = User.query.filter_by(email=email).first()
+    if not user or not check_password_hash(user.password_hash, password):
+        return json_error("Invalid email or password", 401)
 
-    db.session.commit()
-    return jsonify({"ok": True, "enabled": bool(user.enabled)})
+    return jsonify({"ok": True, "api_key": user.api_key})
 
 
 @app.post("/auth/rotate-key")
 @limiter.limit("10 per hour")
 def rotate_key():
-    """
-    Secure way to regenerate an API key.
-    Requires correct email+password.
-    """
     data = request.get_json(silent=True) or {}
     email = (data.get("email") or "").strip().lower()
     password = (data.get("password") or "").strip()
@@ -184,14 +172,12 @@ def status():
     if err:
         return err
 
-    return jsonify(
-        {
-            "ok": True,
-            "enabled": bool(user.enabled),
-            "pair": user.pair,
-            "lot_size": float(user.lot_size),
-        }
-    )
+    return jsonify({
+        "ok": True,
+        "enabled": bool(user.enabled),
+        "pair": user.pair,
+        "lot_size": float(user.lot_size),
+    })
 
 
 @app.post("/api/v1/toggle")
@@ -201,7 +187,14 @@ def toggle():
     if err:
         return err
 
-    user.enabled = not user.enabled
+    data = request.get_json(silent=True) or {}
+    enabled = data.get("enabled", None)
+
+    if enabled is not None:
+        user.enabled = bool(enabled)
+    else:
+        user.enabled = not user.enabled
+
     db.session.commit()
     return jsonify({"ok": True, "enabled": bool(user.enabled)})
 
@@ -215,36 +208,31 @@ def settings():
 
     data = request.get_json(silent=True) or {}
 
-    pair = data.get("pair", None)
-    lot_size = data.get("lot_size", None)
-
-    if pair is not None:
-        pair = str(pair).strip().upper()
+    if "pair" in data:
+        pair = str(data["pair"]).strip().upper()
         if len(pair) < 3 or len(pair) > 12:
             return json_error("pair looks invalid", 400)
         user.pair = pair
 
-    if lot_size is not None:
+    if "lot_size" in data:
         try:
-            lot_size = float(lot_size)
+            lot = float(data["lot_size"])
         except ValueError:
             return json_error("lot_size must be a number", 400)
 
-        if lot_size <= 0 or lot_size > 100:
+        if lot <= 0 or lot > 100:
             return json_error("lot_size out of range", 400)
 
-        user.lot_size = lot_size
+        user.lot_size = lot
 
     db.session.commit()
 
-    return jsonify(
-        {
-            "ok": True,
-            "enabled": bool(user.enabled),
-            "pair": user.pair,
-            "lot_size": float(user.lot_size),
-        }
-    )
+    return jsonify({
+        "ok": True,
+        "enabled": bool(user.enabled),
+        "pair": user.pair,
+        "lot_size": float(user.lot_size),
+    })
 
 
 # -------------------------
@@ -259,4 +247,3 @@ with app.app_context():
 # -------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
-
