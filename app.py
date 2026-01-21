@@ -132,18 +132,25 @@ def register():
     return jsonify({"ok": True, "message": "Registered", "api_key": api_key})
 
 
-@app.post("/auth/login")
-@limiter.limit("30 per hour")
-def login():
+@app.post("/api/v1/toggle")
+@limiter.limit("60 per minute")
+def toggle():
+    user, err = require_api_key()
+    if err:
+        return err
+
     data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
-    password = (data.get("password") or "").strip()
+    enabled = data.get("enabled", None)
 
-    user = User.query.filter_by(email=email).first()
-    if not user or not check_password_hash(user.password_hash, password):
-        return json_error("Invalid email or password", 401)
+    # If UI sends enabled explicitly, use it
+    if enabled is not None:
+        user.enabled = bool(enabled)
+    else:
+        # fallback: old behavior (flip)
+        user.enabled = not user.enabled
 
-    return jsonify({"ok": True, "api_key": user.api_key})
+    db.session.commit()
+    return jsonify({"ok": True, "enabled": bool(user.enabled)})
 
 
 @app.post("/auth/rotate-key")
@@ -252,3 +259,4 @@ with app.app_context():
 # -------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+
