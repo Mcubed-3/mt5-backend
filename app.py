@@ -1,6 +1,6 @@
 import os
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
@@ -62,29 +62,42 @@ class User(db.Model):
     pair = db.Column(db.String(20), default="XAUUSD", nullable=False)
     lot_size = db.Column(db.Float, default=0.01, nullable=False)
 
-    # -------------------------
-    # SL/TP Controls (NEW)
-    # -------------------------
-    # sl_mode: dynamic|fixed
-    sl_mode = db.Column(db.String(20), default="dynamic", nullable=False)
-    # tp_mode: rr|pattern_mult|fixed
-    tp_mode = db.Column(db.String(20), default="rr", nullable=False)
+    # --- SL/TP settings (new) ---
+    sl_mode = db.Column(db.String(20), default="dynamic", nullable=False)          # dynamic | fixed
+    tp_mode = db.Column(db.String(20), default="rr", nullable=False)              # rr | pattern_mult | fixed
 
-    # minimum pips we allow for risk/targets
-    min_pips = db.Column(db.Integer, default=50, nullable=False)
-    # buffer beyond pattern high/low when SL is dynamic
-    sl_buffer_pips = db.Column(db.Integer, default=5, nullable=False)
+    min_pips = db.Column(db.Integer, default=50, nullable=False)                  # floor for SL & TP
+    sl_buffer_pips = db.Column(db.Integer, default=5, nullable=False)             # beyond pattern high/low
 
-    # if tp_mode=rr then TP = risk * rr
-    rr = db.Column(db.Float, default=1.0, nullable=False)
-    # if tp_mode=pattern_mult then TP = pattern_size * pattern_tp_mult
-    pattern_tp_mult = db.Column(db.Float, default=1.5, nullable=False)
+    rr = db.Column(db.Float, default=1.0, nullable=False)                         # risk * rr
+    pattern_tp_mult = db.Column(db.Float, default=1.5, nullable=False)            # pattern_range * mult
 
-    # if sl_mode=fixed / tp_mode=fixed
     fixed_sl_pips = db.Column(db.Integer, default=50, nullable=False)
     fixed_tp_pips = db.Column(db.Integer, default=50, nullable=False)
 
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+class Trade(db.Model):
+    __tablename__ = "trade"
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), index=True, nullable=False)
+    user = db.relationship("User", backref="trades")
+
+    symbol = db.Column(db.String(20), nullable=False)
+    side = db.Column(db.String(10), nullable=False)  # BUY / SELL
+
+    volume = db.Column(db.Float, nullable=False)
+    entry = db.Column(db.Float, nullable=True)
+    sl = db.Column(db.Float, nullable=True)
+    tp = db.Column(db.Float, nullable=True)
+
+    deal_id = db.Column(db.String(64), nullable=True, index=True)
+    profit = db.Column(db.Float, nullable=True)
+
+    opened_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 
 # -------------------------
@@ -104,6 +117,20 @@ def require_api_key():
         return None, json_error("Invalid API key", 401)
 
     return user, None
+
+
+def safe_float(v, default=None):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def safe_int(v, default=None):
+    try:
+        return int(v)
+    except Exception:
+        return default
 
 
 # -------------------------
@@ -138,10 +165,6 @@ def register():
         email=email,
         password_hash=generate_password_hash(password),
         api_key=api_key,
-        enabled=False,
-        pair="XAUUSD",
-        lot_size=0.01,
-        # SL/TP defaults already set by model defaults
     )
 
     try:
@@ -201,7 +224,6 @@ def status():
         "pair": user.pair,
         "lot_size": float(user.lot_size),
 
-        # SL/TP
         "sl_mode": user.sl_mode,
         "tp_mode": user.tp_mode,
         "min_pips": int(user.min_pips),
@@ -241,7 +263,7 @@ def settings():
 
     data = request.get_json(silent=True) or {}
 
-    # ---- basic settings ----
+    # basic
     if "pair" in data:
         pair = str(data["pair"]).strip().upper()
         if len(pair) < 3 or len(pair) > 12:
@@ -249,16 +271,14 @@ def settings():
         user.pair = pair
 
     if "lot_size" in data:
-        try:
-            lot = float(data["lot_size"])
-        except ValueError:
+        lot = safe_float(data["lot_size"])
+        if lot is None:
             return json_error("lot_size must be a number", 400)
-
         if lot <= 0 or lot > 100:
             return json_error("lot_size out of range", 400)
         user.lot_size = lot
 
-    # ---- SL/TP modes ----
+    # sl/tp settings
     if "sl_mode" in data:
         sl_mode = str(data["sl_mode"]).strip().lower()
         if sl_mode not in ("dynamic", "fixed"):
@@ -271,46 +291,129 @@ def settings():
             return json_error("tp_mode must be rr, pattern_mult, or fixed", 400)
         user.tp_mode = tp_mode
 
-    # ---- integers ----
-    for k in ("min_pips", "sl_buffer_pips", "fixed_sl_pips", "fixed_tp_pips"):
-        if k in data:
-            try:
-                v = int(data[k])
-            except ValueError:
-                return json_error(f"{k} must be an integer", 400)
-            if v < 0 or v > 5000:
-                return json_error(f"{k} out of range", 400)
-            setattr(user, k, v)
+    # ints/floats with bounds
+    if "min_pips" in data:
+        v = safe_int(data["min_pips"])
+        if v is None or v < 1 or v > 5000:
+            return json_error("min_pips out of range", 400)
+        user.min_pips = v
 
-    # ---- floats ----
-    for k in ("rr", "pattern_tp_mult"):
-        if k in data:
-            try:
-                v = float(data[k])
-            except ValueError:
-                return json_error(f"{k} must be a number", 400)
-            if v <= 0 or v > 50:
-                return json_error(f"{k} out of range", 400)
-            setattr(user, k, v)
+    if "sl_buffer_pips" in data:
+        v = safe_int(data["sl_buffer_pips"])
+        if v is None or v < 0 or v > 500:
+            return json_error("sl_buffer_pips out of range", 400)
+        user.sl_buffer_pips = v
+
+    if "rr" in data:
+        v = safe_float(data["rr"])
+        if v is None or v < 0.1 or v > 20:
+            return json_error("rr out of range", 400)
+        user.rr = v
+
+    if "pattern_tp_mult" in data:
+        v = safe_float(data["pattern_tp_mult"])
+        if v is None or v < 0.1 or v > 20:
+            return json_error("pattern_tp_mult out of range", 400)
+        user.pattern_tp_mult = v
+
+    if "fixed_sl_pips" in data:
+        v = safe_int(data["fixed_sl_pips"])
+        if v is None or v < 1 or v > 5000:
+            return json_error("fixed_sl_pips out of range", 400)
+        user.fixed_sl_pips = v
+
+    if "fixed_tp_pips" in data:
+        v = safe_int(data["fixed_tp_pips"])
+        if v is None or v < 1 or v > 5000:
+            return json_error("fixed_tp_pips out of range", 400)
+        user.fixed_tp_pips = v
 
     db.session.commit()
+    return status()  # return full settings
 
-    # return everything so UI can refresh instantly
+
+# -------------------------
+# Routes: Trades (EA posts results, UI reads)
+# -------------------------
+@app.post("/api/v1/trades")
+@limiter.limit("120 per minute")
+def post_trade():
+    user, err = require_api_key()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    symbol = (data.get("symbol") or "").strip().upper()
+    side = (data.get("side") or "").strip().upper()
+
+    if not symbol or side not in ("BUY", "SELL"):
+        return json_error("symbol and side (BUY/SELL) required", 400)
+
+    t = Trade(
+        user_id=user.id,
+        symbol=symbol,
+        side=side,
+        volume=safe_float(data.get("volume"), 0.0) or 0.0,
+        entry=safe_float(data.get("entry")),
+        sl=safe_float(data.get("sl")),
+        tp=safe_float(data.get("tp")),
+        deal_id=str(data.get("deal_id") or "")[:64] or None,
+        profit=safe_float(data.get("profit")),
+    )
+    db.session.add(t)
+    db.session.commit()
+
+    return jsonify({"ok": True, "id": t.id})
+
+
+@app.get("/api/v1/trades")
+@limiter.limit("60 per minute")
+def get_trades():
+    user, err = require_api_key()
+    if err:
+        return err
+
+    limit = safe_int(request.args.get("limit", 50), 50)
+    limit = max(1, min(limit, 200))
+
+    rows = (
+        Trade.query
+        .filter_by(user_id=user.id)
+        .order_by(Trade.id.desc())
+        .limit(limit)
+        .all()
+    )
+
     return jsonify({
         "ok": True,
-        "enabled": bool(user.enabled),
-        "pair": user.pair,
-        "lot_size": float(user.lot_size),
-
-        "sl_mode": user.sl_mode,
-        "tp_mode": user.tp_mode,
-        "min_pips": int(user.min_pips),
-        "sl_buffer_pips": int(user.sl_buffer_pips),
-        "rr": float(user.rr),
-        "pattern_tp_mult": float(user.pattern_tp_mult),
-        "fixed_sl_pips": int(user.fixed_sl_pips),
-        "fixed_tp_pips": int(user.fixed_tp_pips),
+        "items": [
+            {
+                "id": r.id,
+                "symbol": r.symbol,
+                "side": r.side,
+                "volume": r.volume,
+                "entry": r.entry,
+                "sl": r.sl,
+                "tp": r.tp,
+                "deal_id": r.deal_id,
+                "profit": r.profit,
+                "opened_at": r.opened_at.isoformat(),
+            }
+            for r in rows
+        ]
     })
+
+
+# -------------------------
+# Security headers
+# -------------------------
+@app.after_request
+def add_security_headers(resp):
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    return resp
 
 
 # -------------------------
