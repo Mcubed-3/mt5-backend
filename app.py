@@ -62,6 +62,28 @@ class User(db.Model):
     pair = db.Column(db.String(20), default="XAUUSD", nullable=False)
     lot_size = db.Column(db.Float, default=0.01, nullable=False)
 
+    # -------------------------
+    # SL/TP Controls (NEW)
+    # -------------------------
+    # sl_mode: dynamic|fixed
+    sl_mode = db.Column(db.String(20), default="dynamic", nullable=False)
+    # tp_mode: rr|pattern_mult|fixed
+    tp_mode = db.Column(db.String(20), default="rr", nullable=False)
+
+    # minimum pips we allow for risk/targets
+    min_pips = db.Column(db.Integer, default=50, nullable=False)
+    # buffer beyond pattern high/low when SL is dynamic
+    sl_buffer_pips = db.Column(db.Integer, default=5, nullable=False)
+
+    # if tp_mode=rr then TP = risk * rr
+    rr = db.Column(db.Float, default=1.0, nullable=False)
+    # if tp_mode=pattern_mult then TP = pattern_size * pattern_tp_mult
+    pattern_tp_mult = db.Column(db.Float, default=1.5, nullable=False)
+
+    # if sl_mode=fixed / tp_mode=fixed
+    fixed_sl_pips = db.Column(db.Integer, default=50, nullable=False)
+    fixed_tp_pips = db.Column(db.Integer, default=50, nullable=False)
+
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
 
@@ -119,6 +141,7 @@ def register():
         enabled=False,
         pair="XAUUSD",
         lot_size=0.01,
+        # SL/TP defaults already set by model defaults
     )
 
     try:
@@ -177,6 +200,16 @@ def status():
         "enabled": bool(user.enabled),
         "pair": user.pair,
         "lot_size": float(user.lot_size),
+
+        # SL/TP
+        "sl_mode": user.sl_mode,
+        "tp_mode": user.tp_mode,
+        "min_pips": int(user.min_pips),
+        "sl_buffer_pips": int(user.sl_buffer_pips),
+        "rr": float(user.rr),
+        "pattern_tp_mult": float(user.pattern_tp_mult),
+        "fixed_sl_pips": int(user.fixed_sl_pips),
+        "fixed_tp_pips": int(user.fixed_tp_pips),
     })
 
 
@@ -208,6 +241,7 @@ def settings():
 
     data = request.get_json(silent=True) or {}
 
+    # ---- basic settings ----
     if "pair" in data:
         pair = str(data["pair"]).strip().upper()
         if len(pair) < 3 or len(pair) > 12:
@@ -222,16 +256,60 @@ def settings():
 
         if lot <= 0 or lot > 100:
             return json_error("lot_size out of range", 400)
-
         user.lot_size = lot
+
+    # ---- SL/TP modes ----
+    if "sl_mode" in data:
+        sl_mode = str(data["sl_mode"]).strip().lower()
+        if sl_mode not in ("dynamic", "fixed"):
+            return json_error("sl_mode must be dynamic or fixed", 400)
+        user.sl_mode = sl_mode
+
+    if "tp_mode" in data:
+        tp_mode = str(data["tp_mode"]).strip().lower()
+        if tp_mode not in ("rr", "pattern_mult", "fixed"):
+            return json_error("tp_mode must be rr, pattern_mult, or fixed", 400)
+        user.tp_mode = tp_mode
+
+    # ---- integers ----
+    for k in ("min_pips", "sl_buffer_pips", "fixed_sl_pips", "fixed_tp_pips"):
+        if k in data:
+            try:
+                v = int(data[k])
+            except ValueError:
+                return json_error(f"{k} must be an integer", 400)
+            if v < 0 or v > 5000:
+                return json_error(f"{k} out of range", 400)
+            setattr(user, k, v)
+
+    # ---- floats ----
+    for k in ("rr", "pattern_tp_mult"):
+        if k in data:
+            try:
+                v = float(data[k])
+            except ValueError:
+                return json_error(f"{k} must be a number", 400)
+            if v <= 0 or v > 50:
+                return json_error(f"{k} out of range", 400)
+            setattr(user, k, v)
 
     db.session.commit()
 
+    # return everything so UI can refresh instantly
     return jsonify({
         "ok": True,
         "enabled": bool(user.enabled),
         "pair": user.pair,
         "lot_size": float(user.lot_size),
+
+        "sl_mode": user.sl_mode,
+        "tp_mode": user.tp_mode,
+        "min_pips": int(user.min_pips),
+        "sl_buffer_pips": int(user.sl_buffer_pips),
+        "rr": float(user.rr),
+        "pattern_tp_mult": float(user.pattern_tp_mult),
+        "fixed_sl_pips": int(user.fixed_sl_pips),
+        "fixed_tp_pips": int(user.fixed_tp_pips),
     })
 
 
