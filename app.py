@@ -59,18 +59,21 @@ class User(db.Model):
     api_key = db.Column(db.String(64), unique=True, nullable=False, index=True)
 
     enabled = db.Column(db.Boolean, default=False, nullable=False)
-    pair = db.Column(db.String(20), default="XAUUSD", nullable=False)
+
+    # NOTE: allow comma-separated symbols list here (length increased)
+    pair = db.Column(db.String(128), default="XAUUSD", nullable=False)
+
     lot_size = db.Column(db.Float, default=0.01, nullable=False)
 
-    # --- SL/TP settings (new) ---
-    sl_mode = db.Column(db.String(20), default="dynamic", nullable=False)          # dynamic | fixed
-    tp_mode = db.Column(db.String(20), default="rr", nullable=False)              # rr | pattern_mult | fixed
+    # --- SL/TP settings ---
+    sl_mode = db.Column(db.String(20), default="dynamic", nullable=False)     # dynamic | fixed
+    tp_mode = db.Column(db.String(20), default="rr", nullable=False)          # rr | pattern_mult | fixed
 
-    min_pips = db.Column(db.Integer, default=50, nullable=False)                  # floor for SL & TP
-    sl_buffer_pips = db.Column(db.Integer, default=5, nullable=False)             # beyond pattern high/low
+    min_pips = db.Column(db.Integer, default=50, nullable=False)
+    sl_buffer_pips = db.Column(db.Integer, default=5, nullable=False)
 
-    rr = db.Column(db.Float, default=1.0, nullable=False)                         # risk * rr
-    pattern_tp_mult = db.Column(db.Float, default=1.5, nullable=False)            # pattern_range * mult
+    rr = db.Column(db.Float, default=1.0, nullable=False)
+    pattern_tp_mult = db.Column(db.Float, default=1.5, nullable=False)
 
     fixed_sl_pips = db.Column(db.Integer, default=50, nullable=False)
     fixed_tp_pips = db.Column(db.Integer, default=50, nullable=False)
@@ -131,6 +134,46 @@ def safe_int(v, default=None):
         return int(v)
     except Exception:
         return default
+
+
+def validate_symbol_list(raw: str):
+    """
+    Accept:
+      - "XAUUSD"
+      - "XAUUSD,EURUSD,GBPUSD,USDJPY"
+    Enforces safe characters and per-symbol length.
+    Returns (cleaned_string, list_of_symbols) or (None, None) on invalid.
+    """
+    s = (raw or "").strip().upper()
+    if not s:
+        return None, None
+
+    # overall length guard
+    if len(s) < 3 or len(s) > 128:
+        return None, None
+
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789,_.")
+    if any(ch not in allowed for ch in s):
+        return None, None
+
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if not parts:
+        return None, None
+
+    # each symbol sanity check
+    for p in parts:
+        if len(p) < 3 or len(p) > 20:
+            return None, None
+
+    # de-dupe while keeping order
+    seen = set()
+    uniq = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+
+    return ",".join(uniq), uniq
 
 
 # -------------------------
@@ -218,21 +261,23 @@ def status():
     if err:
         return err
 
-    return jsonify({
-        "ok": True,
-        "enabled": bool(user.enabled),
-        "pair": user.pair,
-        "lot_size": float(user.lot_size),
+    return jsonify(
+        {
+            "ok": True,
+            "enabled": bool(user.enabled),
+            "pair": user.pair,
+            "lot_size": float(user.lot_size),
 
-        "sl_mode": user.sl_mode,
-        "tp_mode": user.tp_mode,
-        "min_pips": int(user.min_pips),
-        "sl_buffer_pips": int(user.sl_buffer_pips),
-        "rr": float(user.rr),
-        "pattern_tp_mult": float(user.pattern_tp_mult),
-        "fixed_sl_pips": int(user.fixed_sl_pips),
-        "fixed_tp_pips": int(user.fixed_tp_pips),
-    })
+            "sl_mode": user.sl_mode,
+            "tp_mode": user.tp_mode,
+            "min_pips": int(user.min_pips),
+            "sl_buffer_pips": int(user.sl_buffer_pips),
+            "rr": float(user.rr),
+            "pattern_tp_mult": float(user.pattern_tp_mult),
+            "fixed_sl_pips": int(user.fixed_sl_pips),
+            "fixed_tp_pips": int(user.fixed_tp_pips),
+        }
+    )
 
 
 @app.post("/api/v1/toggle")
@@ -265,10 +310,10 @@ def settings():
 
     # basic
     if "pair" in data:
-        pair = str(data["pair"]).strip().upper()
-        if len(pair) < 3 or len(pair) > 12:
-            return json_error("pair looks invalid", 400)
-        user.pair = pair
+        cleaned, _symbols = validate_symbol_list(str(data["pair"]))
+        if not cleaned:
+            return json_error("pair/symbol list looks invalid", 400)
+        user.pair = cleaned
 
     if "lot_size" in data:
         lot = safe_float(data["lot_size"])
@@ -384,24 +429,26 @@ def get_trades():
         .all()
     )
 
-    return jsonify({
-        "ok": True,
-        "items": [
-            {
-                "id": r.id,
-                "symbol": r.symbol,
-                "side": r.side,
-                "volume": r.volume,
-                "entry": r.entry,
-                "sl": r.sl,
-                "tp": r.tp,
-                "deal_id": r.deal_id,
-                "profit": r.profit,
-                "opened_at": r.opened_at.isoformat(),
-            }
-            for r in rows
-        ]
-    })
+    return jsonify(
+        {
+            "ok": True,
+            "items": [
+                {
+                    "id": r.id,
+                    "symbol": r.symbol,
+                    "side": r.side,
+                    "volume": r.volume,
+                    "entry": r.entry,
+                    "sl": r.sl,
+                    "tp": r.tp,
+                    "deal_id": r.deal_id,
+                    "profit": r.profit,
+                    "opened_at": r.opened_at.isoformat(),
+                }
+                for r in rows
+            ],
+        }
+    )
 
 
 # -------------------------
