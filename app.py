@@ -7,6 +7,7 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy import text
 
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -17,33 +18,18 @@ from flask_limiter.util import get_remote_address
 # -------------------------
 app = Flask(__name__)
 
-# ✅ CORS (FIXED): allow your frontend + allow X-API-Key + allow preflight OPTIONS
+# CORS: allow ONLY your frontend origins
 CORS(
     app,
     resources={r"/*": {"origins": ["https://676trades.org", "https://www.676trades.org"]}},
-    methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "X-API-Key"],
-    expose_headers=["Content-Type"],
-    max_age=86400,
 )
 
-# Rate limiting
+# Rate limiting: global defaults
 limiter = Limiter(
     get_remote_address,
     app=app,
     default_limits=["60 per minute"],
 )
-
-# ✅ IMPORTANT: do NOT rate limit OPTIONS preflight (or browsers will fail)
-@limiter.request_filter
-def _skip_rate_limit_for_options():
-    return request.method == "OPTIONS"
-
-# ✅ Handle preflight quickly (some setups still need this)
-@app.before_request
-def handle_preflight():
-    if request.method == "OPTIONS":
-        return ("", 204)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///db.sqlite3")
 
@@ -71,25 +57,27 @@ class User(db.Model):
     email = db.Column(db.String(255), unique=True, nullable=False, index=True)
     password_hash = db.Column(db.String(255), nullable=False)
 
-    # This is YOUR backend user key (not broker key)
     api_key = db.Column(db.String(64), unique=True, nullable=False, index=True)
 
     enabled = db.Column(db.Boolean, default=False, nullable=False)
 
-    # ✅ allow multi-pairs: store as CSV like "XAUUSD,EURUSD,GBPUSD,USDJPY"
+    # Backward compatible (single symbol)
+    pair = db.Column(db.String(20), default="XAUUSD", nullable=False)
+
+    # NEW: multiple symbols as CSV: "XAUUSD,EURUSD,GBPUSD,USDJPY"
     pairs = db.Column(db.String(255), default="XAUUSD", nullable=False)
 
     lot_size = db.Column(db.Float, default=0.01, nullable=False)
 
-    # SL/TP settings
+    # --- SL/TP settings ---
     sl_mode = db.Column(db.String(20), default="dynamic", nullable=False)          # dynamic | fixed
     tp_mode = db.Column(db.String(20), default="rr", nullable=False)              # rr | pattern_mult | fixed
 
-    min_pips = db.Column(db.Integer, default=50, nullable=False)
-    sl_buffer_pips = db.Column(db.Integer, default=5, nullable=False)
+    min_pips = db.Column(db.Integer, default=50, nullable=False)                  # floor for SL & TP
+    sl_buffer_pips = db.Column(db.Integer, default=5, nullable=False)             # beyond pattern high/low
 
-    rr = db.Column(db.Float, default=1.0, nullable=False)
-    pattern_tp_mult = db.Column(db.Float, default=1.5, nullable=False)
+    rr = db.Column(db.Float, default=1.0, nullable=False)                         # risk * rr
+    pattern_tp_mult = db.Column(db.Float, default=1.5, nullable=False)            # pattern_range * mult
 
     fixed_sl_pips = db.Column(db.Integer, default=50, nullable=False)
     fixed_tp_pips = db.Column(db.Integer, default=50, nullable=False)
@@ -152,52 +140,137 @@ def safe_int(v, default=None):
         return default
 
 
-def normalize_pairs(raw: str):
+def normalize_pairs(value: str) -> str:
     """
-    Accept:
-      "XAUUSD"
-      "XAUUSD,EURUSD,GBPUSD,USDJPY"
-      "xauusd eurusd gbpusd usdjpy"
-    Store as CSV uppercase with no spaces.
+    Accepts:
+      "XAUUSD, EURUSD,gbpusd"
+    Returns:
+      "XAUUSD,EURUSD,GBPUSD"
     """
-    if raw is None:
-        return None
-
-    s = str(raw).strip().upper()
-    if not s:
-        return None
-
-    # split by comma or whitespace
-    parts = []
-    for chunk in s.replace(" ", ",").split(","):
-        chunk = chunk.strip().upper()
-        if not chunk:
-            continue
-        parts.append(chunk)
-
-    # basic validation per symbol token
-    cleaned = []
+    parts = [p.strip().upper() for p in (value or "").split(",")]
+    parts = [p for p in parts if p]
+    # basic sanity: symbol length 3..12
     for p in parts:
         if len(p) < 3 or len(p) > 12:
-            return None
-        # keep only A-Z 0-9 . _ (optional)
-        for ch in p:
-            if not (("A" <= ch <= "Z") or ("0" <= ch <= "9") or ch in "._"):
-                return None
-        cleaned.append(p)
-
-    if not cleaned:
-        return None
-
-    # unique while preserving order
+            raise ValueError("pair looks invalid")
+    # de-dup while preserving order
     seen = set()
-    uniq = []
-    for p in cleaned:
+    out = []
+    for p in parts:
         if p not in seen:
-            uniq.append(p)
             seen.add(p)
+            out.append(p)
+    if not out:
+        raise ValueError("pairs cannot be empty")
+    return ",".join(out)
 
-    return ",".join(uniq)
+
+def first_pair(pairs_csv: str) -> str:
+    try:
+        return (pairs_csv or "XAUUSD").split(",")[0].strip().upper() or "XAUUSD"
+    except Exception:
+        return "XAUUSD"
+
+
+# -------------------------
+# Auto-migration (fixes your 'pairs' column issue)
+# -------------------------
+def ensure_schema():
+    """
+    Makes the DB match the app without you resetting Postgres.
+    Specifically fixes:
+      - column user.pairs does not exist
+      - missing SL/TP columns
+      - missing trade table
+    """
+    uri = app.config["SQLALCHEMY_DATABASE_URI"]
+    is_postgres = uri.startswith("postgresql")
+    if not is_postgres:
+        # SQLite: create_all is enough for simple dev usage
+        db.create_all()
+        return
+
+    with db.engine.begin() as conn:
+        # ---- ensure "user" table exists
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS "user" (
+                id SERIAL PRIMARY KEY
+            )
+        """))
+
+        # columns currently in user table
+        cols = {
+            r[0]
+            for r in conn.execute(text("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='user'
+            """)).fetchall()
+        }
+
+        def add_col(col_sql: str):
+            conn.execute(text(col_sql))
+
+        # required base columns
+        if "email" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN email VARCHAR(255)')
+            add_col('CREATE UNIQUE INDEX IF NOT EXISTS ix_user_email ON "user"(email)')
+        if "password_hash" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN password_hash VARCHAR(255)')
+        if "api_key" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN api_key VARCHAR(64)')
+            add_col('CREATE UNIQUE INDEX IF NOT EXISTS ix_user_api_key ON "user"(api_key)')
+        if "enabled" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT FALSE')
+        if "lot_size" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN lot_size DOUBLE PRECISION NOT NULL DEFAULT 0.01')
+        if "created_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()')
+
+        # backward compatible single pair
+        if "pair" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN pair VARCHAR(20) NOT NULL DEFAULT \'XAUUSD\'')
+
+        # NEW multi-pairs (this fixes your crash)
+        if "pairs" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN pairs VARCHAR(255) NOT NULL DEFAULT \'XAUUSD\'')
+
+        # SL/TP columns
+        if "sl_mode" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN sl_mode VARCHAR(20) NOT NULL DEFAULT \'dynamic\'')
+        if "tp_mode" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN tp_mode VARCHAR(20) NOT NULL DEFAULT \'rr\'')
+        if "min_pips" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN min_pips INTEGER NOT NULL DEFAULT 50')
+        if "sl_buffer_pips" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN sl_buffer_pips INTEGER NOT NULL DEFAULT 5')
+        if "rr" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN rr DOUBLE PRECISION NOT NULL DEFAULT 1.0')
+        if "pattern_tp_mult" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN pattern_tp_mult DOUBLE PRECISION NOT NULL DEFAULT 1.5')
+        if "fixed_sl_pips" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN fixed_sl_pips INTEGER NOT NULL DEFAULT 50')
+        if "fixed_tp_pips" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN fixed_tp_pips INTEGER NOT NULL DEFAULT 50')
+
+        # ---- ensure trade table exists
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS trade (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES "user"(id),
+                symbol VARCHAR(20) NOT NULL,
+                side VARCHAR(10) NOT NULL,
+                volume DOUBLE PRECISION NOT NULL,
+                entry DOUBLE PRECISION NULL,
+                sl DOUBLE PRECISION NULL,
+                tp DOUBLE PRECISION NULL,
+                deal_id VARCHAR(64) NULL,
+                profit DOUBLE PRECISION NULL,
+                opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
+        conn.execute(text('CREATE INDEX IF NOT EXISTS ix_trade_user_id ON trade(user_id)'))
+        conn.execute(text('CREATE INDEX IF NOT EXISTS ix_trade_deal_id ON trade(deal_id)'))
 
 
 # -------------------------
@@ -210,6 +283,7 @@ def root():
 
 @app.get("/health")
 def health():
+    # also confirm DB schema is present
     return jsonify({"ok": True})
 
 
@@ -233,6 +307,7 @@ def register():
         password_hash=generate_password_hash(password),
         api_key=api_key,
         enabled=False,
+        pair="XAUUSD",
         pairs="XAUUSD",
         lot_size=0.01,
     )
@@ -288,13 +363,19 @@ def status():
     if err:
         return err
 
+    # keep backward compatibility:
+    # - "pair" = first symbol
+    # - "pairs" = csv list
+    pairs_csv = (user.pairs or user.pair or "XAUUSD").strip()
+    if not pairs_csv:
+        pairs_csv = "XAUUSD"
+
     return jsonify({
         "ok": True,
         "enabled": bool(user.enabled),
 
-        # Backward compatible fields:
-        "pair": (user.pairs.split(",")[0] if user.pairs else "XAUUSD"),
-        "pairs": user.pairs,
+        "pair": first_pair(pairs_csv),   # for older EA
+        "pairs": pairs_csv,              # for dashboard / newer EA
 
         "lot_size": float(user.lot_size),
 
@@ -337,20 +418,26 @@ def settings():
 
     data = request.get_json(silent=True) or {}
 
-    # ----- basic -----
-    # accept "pairs" preferred, or "pair" single for backwards compatibility
+    # --- pairs ---
+    # accept either:
+    #  - "pairs": "XAUUSD,EURUSD,GBPUSD"
+    #  - "pair":  "XAUUSD"  (single)
     if "pairs" in data:
-        normalized = normalize_pairs(data.get("pairs"))
-        if not normalized:
-            return json_error("pairs looks invalid (use e.g. XAUUSD,EURUSD,GBPUSD,USDJPY)", 400)
-        user.pairs = normalized
+        try:
+            user.pairs = normalize_pairs(str(data["pairs"]))
+            user.pair = first_pair(user.pairs)  # keep single in sync
+        except ValueError as e:
+            return json_error(str(e), 400)
 
     if "pair" in data and "pairs" not in data:
-        normalized = normalize_pairs(data.get("pair"))
-        if not normalized:
-            return json_error("pair looks invalid", 400)
-        user.pairs = normalized
+        try:
+            single = normalize_pairs(str(data["pair"]))
+            user.pairs = single
+            user.pair = first_pair(single)
+        except ValueError as e:
+            return json_error(str(e), 400)
 
+    # lot size
     if "lot_size" in data:
         lot = safe_float(data["lot_size"])
         if lot is None:
@@ -359,7 +446,7 @@ def settings():
             return json_error("lot_size out of range", 400)
         user.lot_size = lot
 
-    # ----- sl/tp -----
+    # sl/tp modes
     if "sl_mode" in data:
         sl_mode = str(data["sl_mode"]).strip().lower()
         if sl_mode not in ("dynamic", "fixed"):
@@ -372,6 +459,7 @@ def settings():
             return json_error("tp_mode must be rr, pattern_mult, or fixed", 400)
         user.tp_mode = tp_mode
 
+    # bounds
     if "min_pips" in data:
         v = safe_int(data["min_pips"])
         if v is None or v < 1 or v > 5000:
@@ -497,10 +585,10 @@ def add_security_headers(resp):
 
 
 # -------------------------
-# Ensure tables exist
+# Ensure schema exists (IMPORTANT)
 # -------------------------
 with app.app_context():
-    db.create_all()
+    ensure_schema()
 
 
 # -------------------------
