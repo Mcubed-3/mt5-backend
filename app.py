@@ -1,6 +1,8 @@
 import os
 import secrets
-from datetime import datetime, timezone
+import hashlib
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlencode
 
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
@@ -86,16 +88,24 @@ class User(db.Model):
     sl_mode = db.Column(db.String(20), default="dynamic", nullable=False)          # dynamic | fixed
     tp_mode = db.Column(db.String(20), default="rr", nullable=False)              # rr | pattern_mult | fixed
 
-    min_pips = db.Column(db.Integer, default=50, nullable=False)                  # floor for SL & TP
-    sl_buffer_pips = db.Column(db.Integer, default=5, nullable=False)             # beyond pattern high/low
+    min_pips = db.Column(db.Integer, default=50, nullable=False)
+    sl_buffer_pips = db.Column(db.Integer, default=5, nullable=False)
 
-    rr = db.Column(db.Float, default=1.0, nullable=False)                         # risk * rr
-    pattern_tp_mult = db.Column(db.Float, default=1.5, nullable=False)            # pattern_range * mult
+    rr = db.Column(db.Float, default=1.0, nullable=False)
+    pattern_tp_mult = db.Column(db.Float, default=1.5, nullable=False)
 
     fixed_sl_pips = db.Column(db.Integer, default=50, nullable=False)
     fixed_tp_pips = db.Column(db.Integer, default=50, nullable=False)
 
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    # --- Phase 1 Step 2: password reset fields ---
+    reset_token_hash = db.Column(db.String(64), nullable=True, index=True)
+    reset_token_expires_at = db.Column(db.DateTime, nullable=True)
+
+    # --- Phase 1 Step 3 (light): helpful profile fields ---
+    last_login_at = db.Column(db.DateTime, nullable=True)
+    display_name = db.Column(db.String(120), nullable=True)
 
 
 class Trade(db.Model):
@@ -127,16 +137,12 @@ def json_error(message: str, code: int = 400):
     return jsonify({"ok": False, "error": message}), code
 
 
-def require_api_key():
-    api_key = request.headers.get("X-API-Key", "").strip()
-    if not api_key:
-        return None, json_error("Missing X-API-Key header", 401)
+def now_utc():
+    return datetime.now(timezone.utc)
 
-    user = User.query.filter_by(api_key=api_key).first()
-    if not user:
-        return None, json_error("Invalid API key", 401)
 
-    return user, None
+def sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
 def safe_float(v, default=None):
@@ -155,13 +161,12 @@ def safe_int(v, default=None):
 
 def normalize_pairs(value: str) -> str:
     """
-    Accepts:
-      "XAUUSD, EURUSD,gbpusd"
-    Returns:
-      "XAUUSD,EURUSD,GBPUSD"
+    Accepts:  "XAUUSD, EURUSD,gbpusd"
+    Returns:  "XAUUSD,EURUSD,GBPUSD"
     """
     parts = [p.strip().upper() for p in (value or "").split(",")]
     parts = [p for p in parts if p]
+
     for p in parts:
         if len(p) < 3 or len(p) > 12:
             raise ValueError("pair looks invalid")
@@ -172,8 +177,10 @@ def normalize_pairs(value: str) -> str:
         if p not in seen:
             seen.add(p)
             out.append(p)
+
     if not out:
         raise ValueError("pairs cannot be empty")
+
     return ",".join(out)
 
 
@@ -182,6 +189,18 @@ def first_pair(pairs_csv: str) -> str:
         return (pairs_csv or "XAUUSD").split(",")[0].strip().upper() or "XAUUSD"
     except Exception:
         return "XAUUSD"
+
+
+def require_api_key():
+    api_key = request.headers.get("X-API-Key", "").strip()
+    if not api_key:
+        return None, json_error("Missing X-API-Key header", 401)
+
+    user = User.query.filter_by(api_key=api_key).first()
+    if not user:
+        return None, json_error("Invalid API key", 401)
+
+    return user, None
 
 
 def send_email(to_email: str, subject: str, body: str):
@@ -196,15 +215,12 @@ def send_email(to_email: str, subject: str, body: str):
 
 
 # -------------------------
-# Auto-migration (fixes your 'pairs' column issue)
+# Auto-migration (avoid resetting Postgres)
 # -------------------------
 def ensure_schema():
     """
     Makes the DB match the app without you resetting Postgres.
-    Specifically fixes:
-      - column user.pairs does not exist
-      - missing SL/TP columns
-      - missing trade table
+    Adds missing columns/tables safely.
     """
     uri = app.config["SQLALCHEMY_DATABASE_URI"]
     is_postgres = uri.startswith("postgresql")
@@ -213,7 +229,7 @@ def ensure_schema():
         return
 
     with db.engine.begin() as conn:
-        # ---- ensure "user" table exists
+        # Ensure "user" table exists
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS "user" (
                 id SERIAL PRIMARY KEY
@@ -229,9 +245,10 @@ def ensure_schema():
             """)).fetchall()
         }
 
-        def add_col(col_sql: str):
-            conn.execute(text(col_sql))
+        def add_col(sql: str):
+            conn.execute(text(sql))
 
+        # Base columns
         if "email" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN email VARCHAR(255)')
             add_col('CREATE UNIQUE INDEX IF NOT EXISTS ix_user_email ON "user"(email)')
@@ -247,11 +264,13 @@ def ensure_schema():
         if "created_at" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()')
 
+        # Pair + pairs
         if "pair" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN pair VARCHAR(20) NOT NULL DEFAULT \'XAUUSD\'')
         if "pairs" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN pairs VARCHAR(255) NOT NULL DEFAULT \'XAUUSD\'')
 
+        # SL/TP columns
         if "sl_mode" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN sl_mode VARCHAR(20) NOT NULL DEFAULT \'dynamic\'')
         if "tp_mode" not in cols:
@@ -269,6 +288,20 @@ def ensure_schema():
         if "fixed_tp_pips" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN fixed_tp_pips INTEGER NOT NULL DEFAULT 50')
 
+        # Phase 1 Step 2: reset fields
+        if "reset_token_hash" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN reset_token_hash VARCHAR(64)')
+            add_col('CREATE INDEX IF NOT EXISTS ix_user_reset_token_hash ON "user"(reset_token_hash)')
+        if "reset_token_expires_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN reset_token_expires_at TIMESTAMPTZ NULL')
+
+        # Phase 1 Step 3: profile fields
+        if "last_login_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN last_login_at TIMESTAMPTZ NULL')
+        if "display_name" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN display_name VARCHAR(120) NULL')
+
+        # Ensure trade table exists
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS trade (
                 id SERIAL PRIMARY KEY,
@@ -302,7 +335,7 @@ def health():
 
 
 # -------------------------
-# DEBUG: Email test endpoint
+# DEBUG: email test
 # -------------------------
 @app.post("/debug/test-email")
 @limiter.limit("10 per hour")
@@ -352,16 +385,15 @@ def register():
         db.session.rollback()
         return json_error("Email already registered", 409)
 
-    # Try sending a welcome email (doesn't block registration if it fails)
+    # Welcome email (does NOT block registration if email fails)
     try:
         send_email(
             email,
             "Welcome to 676Trades",
             "Your 676Trades account was created successfully.\n\n"
-            "If you did not create this account, you can ignore this message."
+            "If you did not create this account, ignore this email."
         )
     except Exception as e:
-        # log only; still return success
         print("Welcome email failed:", e)
 
     return jsonify({"ok": True, "message": "Registered", "api_key": api_key})
@@ -377,6 +409,9 @@ def login():
     user = User.query.filter_by(email=email).first()
     if not user or not check_password_hash(user.password_hash, password):
         return json_error("Invalid email or password", 401)
+
+    user.last_login_at = now_utc()
+    db.session.commit()
 
     return jsonify({"ok": True, "api_key": user.api_key})
 
@@ -399,6 +434,110 @@ def rotate_key():
 
 
 # -------------------------
+# Phase 1 Step 2: Password reset
+# -------------------------
+@app.post("/auth/forgot-password")
+@limiter.limit("10 per hour")
+def forgot_password():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        return json_error("Email required", 400)
+
+    user = User.query.filter_by(email=email).first()
+
+    # Always return OK (prevents attackers checking if an email exists)
+    if not user:
+        return jsonify({"ok": True, "message": "If that email exists, a reset link was sent."})
+
+    raw_token = secrets.token_urlsafe(32)
+    user.reset_token_hash = sha256_hex(raw_token)
+    user.reset_token_expires_at = now_utc() + timedelta(minutes=30)
+    db.session.commit()
+
+    reset_url = f"{APP_BASE_URL}/reset.html?{urlencode({'token': raw_token})}"
+
+    try:
+        send_email(
+            user.email,
+            "676Trades Password Reset",
+            "You requested a password reset.\n\n"
+            f"Reset your password (valid 30 minutes):\n{reset_url}\n\n"
+            "If you didn't request this, ignore this email."
+        )
+    except Exception as e:
+        print("Forgot-password email failed:", e)
+
+    return jsonify({"ok": True, "message": "If that email exists, a reset link was sent."})
+
+
+@app.post("/auth/reset-password")
+@limiter.limit("10 per hour")
+def reset_password():
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or "").strip()
+    new_password = (data.get("new_password") or "").strip()
+
+    if not token or not new_password:
+        return json_error("token and new_password required", 400)
+
+    if len(new_password) < 8:
+        return json_error("Password must be at least 8 characters", 400)
+
+    token_hash = sha256_hex(token)
+    user = User.query.filter_by(reset_token_hash=token_hash).first()
+    if not user:
+        return json_error("Invalid or expired token", 400)
+
+    if not user.reset_token_expires_at or user.reset_token_expires_at < now_utc():
+        return json_error("Invalid or expired token", 400)
+
+    user.password_hash = generate_password_hash(new_password)
+    user.reset_token_hash = None
+    user.reset_token_expires_at = None
+    db.session.commit()
+
+    return jsonify({"ok": True, "message": "Password reset successful"})
+
+
+# -------------------------
+# Phase 1 Step 3 (light): Account profile endpoints
+# -------------------------
+@app.get("/account/me")
+@limiter.limit("60 per minute")
+def account_me():
+    user, err = require_api_key()
+    if err:
+        return err
+
+    return jsonify({
+        "ok": True,
+        "email": user.email,
+        "display_name": user.display_name,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
+    })
+
+
+@app.post("/account/profile")
+@limiter.limit("30 per hour")
+def account_profile():
+    user, err = require_api_key()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    name = (data.get("display_name") or "").strip()
+
+    if name and len(name) > 120:
+        return json_error("display_name too long", 400)
+
+    user.display_name = name or None
+    db.session.commit()
+    return jsonify({"ok": True, "display_name": user.display_name})
+
+
+# -------------------------
 # Routes: Control (EA + Dashboard)
 # -------------------------
 @app.get("/api/v1/status")
@@ -408,16 +547,14 @@ def status():
     if err:
         return err
 
-    pairs_csv = (user.pairs or user.pair or "XAUUSD").strip()
-    if not pairs_csv:
-        pairs_csv = "XAUUSD"
+    pairs_csv = (user.pairs or user.pair or "XAUUSD").strip() or "XAUUSD"
 
     return jsonify({
         "ok": True,
         "enabled": bool(user.enabled),
 
-        "pair": first_pair(pairs_csv),
-        "pairs": pairs_csv,
+        "pair": first_pair(pairs_csv),   # backward compatibility
+        "pairs": pairs_csv,              # dashboard / newer EA
 
         "lot_size": float(user.lot_size),
 
@@ -460,6 +597,7 @@ def settings():
 
     data = request.get_json(silent=True) or {}
 
+    # pairs
     if "pairs" in data:
         try:
             user.pairs = normalize_pairs(str(data["pairs"]))
@@ -475,6 +613,7 @@ def settings():
         except ValueError as e:
             return json_error(str(e), 400)
 
+    # lot size
     if "lot_size" in data:
         lot = safe_float(data["lot_size"])
         if lot is None:
@@ -483,6 +622,7 @@ def settings():
             return json_error("lot_size out of range", 400)
         user.lot_size = lot
 
+    # modes
     if "sl_mode" in data:
         sl_mode = str(data["sl_mode"]).strip().lower()
         if sl_mode not in ("dynamic", "fixed"):
@@ -495,6 +635,7 @@ def settings():
             return json_error("tp_mode must be rr, pattern_mult, or fixed", 400)
         user.tp_mode = tp_mode
 
+    # bounds
     if "min_pips" in data:
         v = safe_int(data["min_pips"])
         if v is None or v < 1 or v > 5000:
