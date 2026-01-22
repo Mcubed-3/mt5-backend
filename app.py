@@ -12,6 +12,8 @@ from sqlalchemy import text
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
+from flask_mail import Mail, Message
+
 
 # -------------------------
 # App / Config
@@ -30,6 +32,17 @@ limiter = Limiter(
     app=app,
     default_limits=["60 per minute"],
 )
+
+# Email (Flask-Mail)
+app.config["MAIL_SERVER"] = os.getenv("MAIL_SERVER", "")
+app.config["MAIL_PORT"] = int(os.getenv("MAIL_PORT", "587"))
+app.config["MAIL_USE_TLS"] = os.getenv("MAIL_USE_TLS", "true").lower() == "true"
+app.config["MAIL_USERNAME"] = os.getenv("MAIL_USERNAME", "")
+app.config["MAIL_PASSWORD"] = os.getenv("MAIL_PASSWORD", "")
+app.config["MAIL_DEFAULT_SENDER"] = os.getenv("MAIL_DEFAULT_SENDER", app.config["MAIL_USERNAME"] or "")
+mail = Mail(app)
+
+APP_BASE_URL = os.getenv("APP_BASE_URL", "https://676trades.org").rstrip("/")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///db.sqlite3")
 
@@ -149,11 +162,10 @@ def normalize_pairs(value: str) -> str:
     """
     parts = [p.strip().upper() for p in (value or "").split(",")]
     parts = [p for p in parts if p]
-    # basic sanity: symbol length 3..12
     for p in parts:
         if len(p) < 3 or len(p) > 12:
             raise ValueError("pair looks invalid")
-    # de-dup while preserving order
+
     seen = set()
     out = []
     for p in parts:
@@ -172,6 +184,17 @@ def first_pair(pairs_csv: str) -> str:
         return "XAUUSD"
 
 
+def send_email(to_email: str, subject: str, body: str):
+    """
+    Uses Flask-Mail to send an email.
+    Requires MAIL_* env vars set in Render.
+    """
+    if not app.config.get("MAIL_SERVER") or not app.config.get("MAIL_USERNAME"):
+        raise RuntimeError("Email not configured. Set MAIL_* env vars in Render.")
+    msg = Message(subject=subject, recipients=[to_email], body=body)
+    mail.send(msg)
+
+
 # -------------------------
 # Auto-migration (fixes your 'pairs' column issue)
 # -------------------------
@@ -186,7 +209,6 @@ def ensure_schema():
     uri = app.config["SQLALCHEMY_DATABASE_URI"]
     is_postgres = uri.startswith("postgresql")
     if not is_postgres:
-        # SQLite: create_all is enough for simple dev usage
         db.create_all()
         return
 
@@ -198,7 +220,6 @@ def ensure_schema():
             )
         """))
 
-        # columns currently in user table
         cols = {
             r[0]
             for r in conn.execute(text("""
@@ -211,7 +232,6 @@ def ensure_schema():
         def add_col(col_sql: str):
             conn.execute(text(col_sql))
 
-        # required base columns
         if "email" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN email VARCHAR(255)')
             add_col('CREATE UNIQUE INDEX IF NOT EXISTS ix_user_email ON "user"(email)')
@@ -227,15 +247,11 @@ def ensure_schema():
         if "created_at" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()')
 
-        # backward compatible single pair
         if "pair" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN pair VARCHAR(20) NOT NULL DEFAULT \'XAUUSD\'')
-
-        # NEW multi-pairs (this fixes your crash)
         if "pairs" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN pairs VARCHAR(255) NOT NULL DEFAULT \'XAUUSD\'')
 
-        # SL/TP columns
         if "sl_mode" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN sl_mode VARCHAR(20) NOT NULL DEFAULT \'dynamic\'')
         if "tp_mode" not in cols:
@@ -253,7 +269,6 @@ def ensure_schema():
         if "fixed_tp_pips" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN fixed_tp_pips INTEGER NOT NULL DEFAULT 50')
 
-        # ---- ensure trade table exists
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS trade (
                 id SERIAL PRIMARY KEY,
@@ -283,8 +298,26 @@ def root():
 
 @app.get("/health")
 def health():
-    # also confirm DB schema is present
     return jsonify({"ok": True})
+
+
+# -------------------------
+# DEBUG: Email test endpoint
+# -------------------------
+@app.post("/debug/test-email")
+@limiter.limit("10 per hour")
+def test_email():
+    data = request.get_json(silent=True) or {}
+    to_email = (data.get("email") or "").strip().lower()
+    if not to_email:
+        return json_error("email required", 400)
+
+    try:
+        send_email(to_email, "676Trades Test Email", "If you received this, email is working.")
+    except Exception as e:
+        return json_error(f"Email send failed: {e}", 500)
+
+    return jsonify({"ok": True, "message": "Email sent"})
 
 
 # -------------------------
@@ -318,6 +351,18 @@ def register():
     except IntegrityError:
         db.session.rollback()
         return json_error("Email already registered", 409)
+
+    # Try sending a welcome email (doesn't block registration if it fails)
+    try:
+        send_email(
+            email,
+            "Welcome to 676Trades",
+            "Your 676Trades account was created successfully.\n\n"
+            "If you did not create this account, you can ignore this message."
+        )
+    except Exception as e:
+        # log only; still return success
+        print("Welcome email failed:", e)
 
     return jsonify({"ok": True, "message": "Registered", "api_key": api_key})
 
@@ -363,9 +408,6 @@ def status():
     if err:
         return err
 
-    # keep backward compatibility:
-    # - "pair" = first symbol
-    # - "pairs" = csv list
     pairs_csv = (user.pairs or user.pair or "XAUUSD").strip()
     if not pairs_csv:
         pairs_csv = "XAUUSD"
@@ -374,8 +416,8 @@ def status():
         "ok": True,
         "enabled": bool(user.enabled),
 
-        "pair": first_pair(pairs_csv),   # for older EA
-        "pairs": pairs_csv,              # for dashboard / newer EA
+        "pair": first_pair(pairs_csv),
+        "pairs": pairs_csv,
 
         "lot_size": float(user.lot_size),
 
@@ -418,14 +460,10 @@ def settings():
 
     data = request.get_json(silent=True) or {}
 
-    # --- pairs ---
-    # accept either:
-    #  - "pairs": "XAUUSD,EURUSD,GBPUSD"
-    #  - "pair":  "XAUUSD"  (single)
     if "pairs" in data:
         try:
             user.pairs = normalize_pairs(str(data["pairs"]))
-            user.pair = first_pair(user.pairs)  # keep single in sync
+            user.pair = first_pair(user.pairs)
         except ValueError as e:
             return json_error(str(e), 400)
 
@@ -437,7 +475,6 @@ def settings():
         except ValueError as e:
             return json_error(str(e), 400)
 
-    # lot size
     if "lot_size" in data:
         lot = safe_float(data["lot_size"])
         if lot is None:
@@ -446,7 +483,6 @@ def settings():
             return json_error("lot_size out of range", 400)
         user.lot_size = lot
 
-    # sl/tp modes
     if "sl_mode" in data:
         sl_mode = str(data["sl_mode"]).strip().lower()
         if sl_mode not in ("dynamic", "fixed"):
@@ -459,7 +495,6 @@ def settings():
             return json_error("tp_mode must be rr, pattern_mult, or fixed", 400)
         user.tp_mode = tp_mode
 
-    # bounds
     if "min_pips" in data:
         v = safe_int(data["min_pips"])
         if v is None or v < 1 or v > 5000:
