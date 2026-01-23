@@ -1,8 +1,6 @@
 import os
 import secrets
-import hashlib
-from datetime import datetime, timezone, timedelta
-from urllib.parse import urlencode
+from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
@@ -14,7 +12,7 @@ from sqlalchemy import text
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
-from flask_mail import Mail, Message
+import stripe
 
 
 # -------------------------
@@ -28,23 +26,11 @@ CORS(
     resources={r"/*": {"origins": ["https://676trades.org", "https://www.676trades.org"]}},
 )
 
-# Rate limiting: global defaults
 limiter = Limiter(
     get_remote_address,
     app=app,
     default_limits=["60 per minute"],
 )
-
-# Email (Flask-Mail)
-app.config["MAIL_SERVER"] = os.getenv("MAIL_SERVER", "")
-app.config["MAIL_PORT"] = int(os.getenv("MAIL_PORT", "587"))
-app.config["MAIL_USE_TLS"] = os.getenv("MAIL_USE_TLS", "true").lower() == "true"
-app.config["MAIL_USERNAME"] = os.getenv("MAIL_USERNAME", "")
-app.config["MAIL_PASSWORD"] = os.getenv("MAIL_PASSWORD", "")
-app.config["MAIL_DEFAULT_SENDER"] = os.getenv("MAIL_DEFAULT_SENDER", app.config["MAIL_USERNAME"] or "")
-mail = Mail(app)
-
-APP_BASE_URL = os.getenv("APP_BASE_URL", "https://676trades.org").rstrip("/")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///db.sqlite3")
 
@@ -57,8 +43,30 @@ if DATABASE_URL.startswith("postgresql://"):
 
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
 db = SQLAlchemy(app)
+
+# -------------------------
+# Stripe config (Render env vars)
+# -------------------------
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
+STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "").strip()
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
+
+# Where Stripe sends users back after checkout
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://676trades.org").strip().rstrip("/")
+
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
+
+
+# -------------------------
+# Plan rules
+# -------------------------
+FREE_MAX_PAIRS = 1
+PRO_MAX_PAIRS = 4
+
+FREE_MAX_LOT = 0.01
+PRO_MAX_LOT = 1.0
 
 
 # -------------------------
@@ -97,15 +105,21 @@ class User(db.Model):
     fixed_sl_pips = db.Column(db.Integer, default=50, nullable=False)
     fixed_tp_pips = db.Column(db.Integer, default=50, nullable=False)
 
+    # --- account profile fields (useful now) ---
+    display_name = db.Column(db.String(80), nullable=True)
+    last_login_at = db.Column(db.DateTime, nullable=True)
+
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
-    # --- Phase 1 Step 2: password reset fields ---
-    reset_token_hash = db.Column(db.String(64), nullable=True, index=True)
-    reset_token_expires_at = db.Column(db.DateTime, nullable=True)
+    # --- Stripe subscription fields ---
+    plan = db.Column(db.String(20), default="free", nullable=False)  # free/pro
+    subscription_status = db.Column(db.String(20), default="none", nullable=False)  # none/trialing/active/past_due/canceled/incomplete
+    stripe_customer_id = db.Column(db.String(80), nullable=True, index=True)
+    stripe_subscription_id = db.Column(db.String(80), nullable=True, index=True)
 
-    # --- Phase 1 Step 3 (light): helpful profile fields ---
-    last_login_at = db.Column(db.DateTime, nullable=True)
-    display_name = db.Column(db.String(120), nullable=True)
+    # useful timestamps (optional but helpful)
+    trial_ends_at = db.Column(db.DateTime, nullable=True)
+    current_period_end = db.Column(db.DateTime, nullable=True)
 
 
 class Trade(db.Model):
@@ -137,12 +151,16 @@ def json_error(message: str, code: int = 400):
     return jsonify({"ok": False, "error": message}), code
 
 
-def now_utc():
-    return datetime.now(timezone.utc)
+def require_api_key():
+    api_key = request.headers.get("X-API-Key", "").strip()
+    if not api_key:
+        return None, json_error("Missing X-API-Key header", 401)
 
+    user = User.query.filter_by(api_key=api_key).first()
+    if not user:
+        return None, json_error("Invalid API key", 401)
 
-def sha256_hex(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+    return user, None
 
 
 def safe_float(v, default=None):
@@ -160,27 +178,19 @@ def safe_int(v, default=None):
 
 
 def normalize_pairs(value: str) -> str:
-    """
-    Accepts:  "XAUUSD, EURUSD,gbpusd"
-    Returns:  "XAUUSD,EURUSD,GBPUSD"
-    """
     parts = [p.strip().upper() for p in (value or "").split(",")]
     parts = [p for p in parts if p]
-
     for p in parts:
         if len(p) < 3 or len(p) > 12:
             raise ValueError("pair looks invalid")
-
     seen = set()
     out = []
     for p in parts:
         if p not in seen:
             seen.add(p)
             out.append(p)
-
     if not out:
         raise ValueError("pairs cannot be empty")
-
     return ",".join(out)
 
 
@@ -191,37 +201,41 @@ def first_pair(pairs_csv: str) -> str:
         return "XAUUSD"
 
 
-def require_api_key():
-    api_key = request.headers.get("X-API-Key", "").strip()
-    if not api_key:
-        return None, json_error("Missing X-API-Key header", 401)
-
-    user = User.query.filter_by(api_key=api_key).first()
-    if not user:
-        return None, json_error("Invalid API key", 401)
-
-    return user, None
-
-
-def send_email(to_email: str, subject: str, body: str):
+def has_access(user: User) -> bool:
     """
-    Uses Flask-Mail to send an email.
-    Requires MAIL_* env vars set in Render.
+    Only allow EA control when user is trialing or active.
     """
-    if not app.config.get("MAIL_SERVER") or not app.config.get("MAIL_USERNAME"):
-        raise RuntimeError("Email not configured. Set MAIL_* env vars in Render.")
-    msg = Message(subject=subject, recipients=[to_email], body=body)
-    mail.send(msg)
+    return (user.subscription_status in ("trialing", "active"))
+
+
+def plan_limits(user: User):
+    if has_access(user):
+        return ("pro", PRO_MAX_PAIRS, PRO_MAX_LOT)
+    return ("free", FREE_MAX_PAIRS, FREE_MAX_LOT)
+
+
+def clamp_enabled_for_unpaid(user: User):
+    """
+    Safety: unpaid users must never have enabled=true.
+    """
+    if not has_access(user) and user.enabled:
+        user.enabled = False
+        db.session.commit()
+
+
+def unix_to_dt(ts):
+    if ts is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc)
+    except Exception:
+        return None
 
 
 # -------------------------
-# Auto-migration (avoid resetting Postgres)
+# Auto-migration
 # -------------------------
 def ensure_schema():
-    """
-    Makes the DB match the app without you resetting Postgres.
-    Adds missing columns/tables safely.
-    """
     uri = app.config["SQLALCHEMY_DATABASE_URI"]
     is_postgres = uri.startswith("postgresql")
     if not is_postgres:
@@ -229,7 +243,6 @@ def ensure_schema():
         return
 
     with db.engine.begin() as conn:
-        # Ensure "user" table exists
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS "user" (
                 id SERIAL PRIMARY KEY
@@ -248,7 +261,7 @@ def ensure_schema():
         def add_col(sql: str):
             conn.execute(text(sql))
 
-        # Base columns
+        # base auth
         if "email" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN email VARCHAR(255)')
             add_col('CREATE UNIQUE INDEX IF NOT EXISTS ix_user_email ON "user"(email)')
@@ -257,20 +270,18 @@ def ensure_schema():
         if "api_key" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN api_key VARCHAR(64)')
             add_col('CREATE UNIQUE INDEX IF NOT EXISTS ix_user_api_key ON "user"(api_key)')
+
+        # core settings
         if "enabled" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT FALSE')
-        if "lot_size" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN lot_size DOUBLE PRECISION NOT NULL DEFAULT 0.01')
-        if "created_at" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()')
-
-        # Pair + pairs
         if "pair" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN pair VARCHAR(20) NOT NULL DEFAULT \'XAUUSD\'')
         if "pairs" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN pairs VARCHAR(255) NOT NULL DEFAULT \'XAUUSD\'')
+        if "lot_size" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN lot_size DOUBLE PRECISION NOT NULL DEFAULT 0.01')
 
-        # SL/TP columns
+        # sl/tp
         if "sl_mode" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN sl_mode VARCHAR(20) NOT NULL DEFAULT \'dynamic\'')
         if "tp_mode" not in cols:
@@ -288,20 +299,31 @@ def ensure_schema():
         if "fixed_tp_pips" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN fixed_tp_pips INTEGER NOT NULL DEFAULT 50')
 
-        # Phase 1 Step 2: reset fields
-        if "reset_token_hash" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN reset_token_hash VARCHAR(64)')
-            add_col('CREATE INDEX IF NOT EXISTS ix_user_reset_token_hash ON "user"(reset_token_hash)')
-        if "reset_token_expires_at" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN reset_token_expires_at TIMESTAMPTZ NULL')
-
-        # Phase 1 Step 3: profile fields
-        if "last_login_at" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN last_login_at TIMESTAMPTZ NULL')
+        # profile
         if "display_name" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN display_name VARCHAR(120) NULL')
+            add_col('ALTER TABLE "user" ADD COLUMN display_name VARCHAR(80)')
+        if "last_login_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN last_login_at TIMESTAMPTZ')
+        if "created_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()')
 
-        # Ensure trade table exists
+        # stripe fields
+        if "plan" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN plan VARCHAR(20) NOT NULL DEFAULT \'free\'')
+        if "subscription_status" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN subscription_status VARCHAR(20) NOT NULL DEFAULT \'none\'')
+        if "stripe_customer_id" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN stripe_customer_id VARCHAR(80)')
+            add_col('CREATE INDEX IF NOT EXISTS ix_user_stripe_customer_id ON "user"(stripe_customer_id)')
+        if "stripe_subscription_id" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN stripe_subscription_id VARCHAR(80)')
+            add_col('CREATE INDEX IF NOT EXISTS ix_user_stripe_subscription_id ON "user"(stripe_subscription_id)')
+        if "trial_ends_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN trial_ends_at TIMESTAMPTZ')
+        if "current_period_end" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN current_period_end TIMESTAMPTZ')
+
+        # trade table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS trade (
                 id SERIAL PRIMARY KEY,
@@ -322,35 +344,40 @@ def ensure_schema():
 
 
 # -------------------------
+# Stripe helpers
+# -------------------------
+def stripe_enabled():
+    return bool(STRIPE_SECRET_KEY and STRIPE_PRICE_ID)
+
+
+def update_user_from_subscription(user: User, sub: dict):
+    """
+    sub is Stripe subscription object (dict).
+    """
+    status = (sub.get("status") or "none").lower()
+    user.subscription_status = status
+
+    user.stripe_subscription_id = sub.get("id") or user.stripe_subscription_id
+
+    # trial_end/current_period_end are unix timestamps
+    user.trial_ends_at = unix_to_dt(sub.get("trial_end"))
+    user.current_period_end = unix_to_dt(sub.get("current_period_end"))
+
+    # plan mapping: trialing/active => pro else free
+    user.plan = "pro" if status in ("trialing", "active") else "free"
+
+
+# -------------------------
 # Routes: Health
 # -------------------------
 @app.get("/")
 def root():
-    return jsonify({"ok": True, "service": "mt5-control-backend", "version": "v1"})
+    return jsonify({"ok": True, "service": "mt5-control-backend", "version": "v2"})
 
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True})
-
-
-# -------------------------
-# DEBUG: email test
-# -------------------------
-@app.post("/debug/test-email")
-@limiter.limit("10 per hour")
-def test_email():
-    data = request.get_json(silent=True) or {}
-    to_email = (data.get("email") or "").strip().lower()
-    if not to_email:
-        return json_error("email required", 400)
-
-    try:
-        send_email(to_email, "676Trades Test Email", "If you received this, email is working.")
-    except Exception as e:
-        return json_error(f"Email send failed: {e}", 500)
-
-    return jsonify({"ok": True, "message": "Email sent"})
+    return jsonify({"ok": True, "stripe": stripe_enabled()})
 
 
 # -------------------------
@@ -376,6 +403,8 @@ def register():
         pair="XAUUSD",
         pairs="XAUUSD",
         lot_size=0.01,
+        plan="free",
+        subscription_status="none",
     )
 
     try:
@@ -384,17 +413,6 @@ def register():
     except IntegrityError:
         db.session.rollback()
         return json_error("Email already registered", 409)
-
-    # Welcome email (does NOT block registration if email fails)
-    try:
-        send_email(
-            email,
-            "Welcome to 676Trades",
-            "Your 676Trades account was created successfully.\n\n"
-            "If you did not create this account, ignore this email."
-        )
-    except Exception as e:
-        print("Welcome email failed:", e)
 
     return jsonify({"ok": True, "message": "Registered", "api_key": api_key})
 
@@ -410,7 +428,7 @@ def login():
     if not user or not check_password_hash(user.password_hash, password):
         return json_error("Invalid email or password", 401)
 
-    user.last_login_at = now_utc()
+    user.last_login_at = datetime.now(timezone.utc)
     db.session.commit()
 
     return jsonify({"ok": True, "api_key": user.api_key})
@@ -434,107 +452,119 @@ def rotate_key():
 
 
 # -------------------------
-# Phase 1 Step 2: Password reset
+# Routes: Billing (Stripe)
 # -------------------------
-@app.post("/auth/forgot-password")
-@limiter.limit("10 per hour")
-def forgot_password():
-    data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
-    if not email:
-        return json_error("Email required", 400)
-
-    user = User.query.filter_by(email=email).first()
-
-    # Always return OK (prevents attackers checking if an email exists)
-    if not user:
-        return jsonify({"ok": True, "message": "If that email exists, a reset link was sent."})
-
-    raw_token = secrets.token_urlsafe(32)
-    user.reset_token_hash = sha256_hex(raw_token)
-    user.reset_token_expires_at = now_utc() + timedelta(minutes=30)
-    db.session.commit()
-
-    reset_url = f"{APP_BASE_URL}/reset.html?{urlencode({'token': raw_token})}"
-
-    try:
-        send_email(
-            user.email,
-            "676Trades Password Reset",
-            "You requested a password reset.\n\n"
-            f"Reset your password (valid 30 minutes):\n{reset_url}\n\n"
-            "If you didn't request this, ignore this email."
-        )
-    except Exception as e:
-        print("Forgot-password email failed:", e)
-
-    return jsonify({"ok": True, "message": "If that email exists, a reset link was sent."})
-
-
-@app.post("/auth/reset-password")
-@limiter.limit("10 per hour")
-def reset_password():
-    data = request.get_json(silent=True) or {}
-    token = (data.get("token") or "").strip()
-    new_password = (data.get("new_password") or "").strip()
-
-    if not token or not new_password:
-        return json_error("token and new_password required", 400)
-
-    if len(new_password) < 8:
-        return json_error("Password must be at least 8 characters", 400)
-
-    token_hash = sha256_hex(token)
-    user = User.query.filter_by(reset_token_hash=token_hash).first()
-    if not user:
-        return json_error("Invalid or expired token", 400)
-
-    if not user.reset_token_expires_at or user.reset_token_expires_at < now_utc():
-        return json_error("Invalid or expired token", 400)
-
-    user.password_hash = generate_password_hash(new_password)
-    user.reset_token_hash = None
-    user.reset_token_expires_at = None
-    db.session.commit()
-
-    return jsonify({"ok": True, "message": "Password reset successful"})
-
-
-# -------------------------
-# Phase 1 Step 3 (light): Account profile endpoints
-# -------------------------
-@app.get("/account/me")
+@app.get("/billing/status")
 @limiter.limit("60 per minute")
-def account_me():
+def billing_status():
     user, err = require_api_key()
     if err:
         return err
+
+    clamp_enabled_for_unpaid(user)
 
     return jsonify({
         "ok": True,
-        "email": user.email,
-        "display_name": user.display_name,
-        "created_at": user.created_at.isoformat() if user.created_at else None,
-        "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
+        "plan": user.plan,
+        "subscription_status": user.subscription_status,
+        "trial_ends_at": user.trial_ends_at.isoformat() if user.trial_ends_at else None,
+        "current_period_end": user.current_period_end.isoformat() if user.current_period_end else None,
+        "has_access": has_access(user),
     })
 
 
-@app.post("/account/profile")
+@app.post("/billing/checkout")
 @limiter.limit("30 per hour")
-def account_profile():
+def billing_checkout():
+    """
+    Creates a Stripe Checkout session for subscription.
+    The 5-day trial is enforced by Stripe.
+    """
+    if not stripe_enabled():
+        return json_error("Stripe is not configured on the server.", 500)
+
     user, err = require_api_key()
     if err:
         return err
 
-    data = request.get_json(silent=True) or {}
-    name = (data.get("display_name") or "").strip()
+    # Create Stripe customer if needed
+    if not user.stripe_customer_id:
+        cust = stripe.Customer.create(email=user.email, metadata={"user_id": str(user.id)})
+        user.stripe_customer_id = cust["id"]
+        db.session.commit()
 
-    if name and len(name) > 120:
-        return json_error("display_name too long", 400)
+    success_url = f"{FRONTEND_URL}/billing.html?success=1"
+    cancel_url = f"{FRONTEND_URL}/billing.html?canceled=1"
 
-    user.display_name = name or None
-    db.session.commit()
-    return jsonify({"ok": True, "display_name": user.display_name})
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        customer=user.stripe_customer_id,
+        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        subscription_data={
+            "trial_period_days": 5,   # ✅ your free trial
+            "metadata": {"user_id": str(user.id)}
+        },
+        client_reference_id=str(user.id),
+        success_url=success_url,
+        cancel_url=cancel_url,
+    )
+
+    return jsonify({"ok": True, "checkout_url": session["url"]})
+
+
+@app.post("/billing/webhook")
+def stripe_webhook():
+    """
+    Stripe sends subscription updates here.
+    Make sure STRIPE_WEBHOOK_SECRET is set.
+    """
+    if not STRIPE_WEBHOOK_SECRET:
+        return json_error("Webhook secret not configured.", 500)
+
+    payload = request.data
+    sig_header = request.headers.get("Stripe-Signature", "")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except Exception:
+        return json_error("Invalid webhook signature", 400)
+
+    event_type = event.get("type")
+    obj = event.get("data", {}).get("object", {})
+
+    # 1) Checkout finished (customer paid/started subscription)
+    if event_type == "checkout.session.completed":
+        customer_id = obj.get("customer")
+        subscription_id = obj.get("subscription")
+
+        user = None
+        if customer_id:
+            user = User.query.filter_by(stripe_customer_id=customer_id).first()
+
+        if user and subscription_id:
+            try:
+                sub = stripe.Subscription.retrieve(subscription_id)
+                update_user_from_subscription(user, sub)
+                db.session.commit()
+            except Exception:
+                pass
+
+    # 2) Subscription lifecycle changes
+    if event_type in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
+        customer_id = obj.get("customer")
+        subscription_id = obj.get("id")
+
+        user = None
+        if customer_id:
+            user = User.query.filter_by(stripe_customer_id=customer_id).first()
+
+        if user:
+            update_user_from_subscription(user, obj)
+            # If canceled/inactive -> disable EA immediately
+            clamp_enabled_for_unpaid(user)
+            db.session.commit()
+
+    return jsonify({"ok": True})
 
 
 # -------------------------
@@ -547,6 +577,8 @@ def status():
     if err:
         return err
 
+    clamp_enabled_for_unpaid(user)
+
     pairs_csv = (user.pairs or user.pair or "XAUUSD").strip() or "XAUUSD"
 
     return jsonify({
@@ -554,7 +586,7 @@ def status():
         "enabled": bool(user.enabled),
 
         "pair": first_pair(pairs_csv),   # backward compatibility
-        "pairs": pairs_csv,              # dashboard / newer EA
+        "pairs": pairs_csv,              # new
 
         "lot_size": float(user.lot_size),
 
@@ -566,6 +598,11 @@ def status():
         "pattern_tp_mult": float(user.pattern_tp_mult),
         "fixed_sl_pips": int(user.fixed_sl_pips),
         "fixed_tp_pips": int(user.fixed_tp_pips),
+
+        # billing info (useful for UI)
+        "plan": user.plan,
+        "subscription_status": user.subscription_status,
+        "has_access": has_access(user),
     })
 
 
@@ -575,6 +612,11 @@ def toggle():
     user, err = require_api_key()
     if err:
         return err
+
+    if not has_access(user):
+        user.enabled = False
+        db.session.commit()
+        return json_error("Payment required. Please subscribe to enable the algorithm.", 402)
 
     data = request.get_json(silent=True) or {}
     enabled = data.get("enabled", None)
@@ -595,23 +637,42 @@ def settings():
     if err:
         return err
 
+    if not has_access(user):
+        user.enabled = False
+        db.session.commit()
+        return json_error("Payment required. Please subscribe to change settings.", 402)
+
+    # enforce plan limits
+    plan_name, max_pairs, max_lot = plan_limits(user)
+
     data = request.get_json(silent=True) or {}
 
-    # pairs
+    # pairs (accept "pairs" OR "pair")
     if "pairs" in data:
         try:
-            user.pairs = normalize_pairs(str(data["pairs"]))
-            user.pair = first_pair(user.pairs)
+            csv = normalize_pairs(str(data["pairs"]))
         except ValueError as e:
             return json_error(str(e), 400)
+
+        count = len(csv.split(","))
+        if count > max_pairs:
+            return json_error(f"Plan limit: max {max_pairs} pairs for {plan_name}.", 403)
+
+        user.pairs = csv
+        user.pair = first_pair(csv)  # keep single in sync
 
     if "pair" in data and "pairs" not in data:
         try:
-            single = normalize_pairs(str(data["pair"]))
-            user.pairs = single
-            user.pair = first_pair(single)
+            csv = normalize_pairs(str(data["pair"]))
         except ValueError as e:
             return json_error(str(e), 400)
+
+        count = len(csv.split(","))
+        if count > max_pairs:
+            return json_error(f"Plan limit: max {max_pairs} pairs for {plan_name}.", 403)
+
+        user.pairs = csv
+        user.pair = first_pair(csv)
 
     # lot size
     if "lot_size" in data:
@@ -620,9 +681,11 @@ def settings():
             return json_error("lot_size must be a number", 400)
         if lot <= 0 or lot > 100:
             return json_error("lot_size out of range", 400)
+        if lot > max_lot:
+            return json_error(f"Plan limit: max lot size {max_lot} for {plan_name}.", 403)
         user.lot_size = lot
 
-    # modes
+    # sl/tp modes
     if "sl_mode" in data:
         sl_mode = str(data["sl_mode"]).strip().lower()
         if sl_mode not in ("dynamic", "fixed"):
@@ -761,7 +824,7 @@ def add_security_headers(resp):
 
 
 # -------------------------
-# Ensure schema exists (IMPORTANT)
+# Ensure schema exists
 # -------------------------
 with app.app_context():
     ensure_schema()
