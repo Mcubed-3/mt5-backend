@@ -108,6 +108,11 @@ class User(db.Model):
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     last_login_at = db.Column(db.DateTime, nullable=True)
 
+    # ✅ EA Heartbeat fields
+    last_seen_at = db.Column(db.DateTime, nullable=True)
+    last_seen_symbol = db.Column(db.String(20), nullable=True)
+    mt5_account_id = db.Column(db.String(64), nullable=True)
+
 
 class Trade(db.Model):
     __tablename__ = "trade"
@@ -192,7 +197,6 @@ def trial_active(user: User) -> bool:
     if not user.trial_ends_at:
         return False
     now = datetime.now(timezone.utc)
-    # user.trial_ends_at might be naive depending on DB; normalize
     t = user.trial_ends_at
     if t.tzinfo is None:
         t = t.replace(tzinfo=timezone.utc)
@@ -204,11 +208,9 @@ def is_paid_active(user: User) -> bool:
 
 
 def ensure_can_trade(user: User):
-    # allow if paid active OR trial still active
     if is_paid_active(user) or trial_active(user):
         return None
 
-    # force disabled for unpaid
     if user.enabled:
         user.enabled = False
         db.session.commit()
@@ -260,6 +262,14 @@ def ensure_schema():
             add_col('ALTER TABLE "user" ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()')
         if "last_login_at" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN last_login_at TIMESTAMPTZ NULL')
+
+        # ✅ heartbeat columns
+        if "last_seen_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN last_seen_at TIMESTAMPTZ NULL')
+        if "last_seen_symbol" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN last_seen_symbol VARCHAR(20) NULL')
+        if "mt5_account_id" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN mt5_account_id VARCHAR(64) NULL')
 
         # sl/tp
         if "sl_mode" not in cols:
@@ -431,6 +441,11 @@ def status():
         "plan": user.plan,
         "subscription_status": user.subscription_status,
         "trial_ends_at": user.trial_ends_at.isoformat() if user.trial_ends_at else None,
+
+        # ✅ heartbeat snapshot
+        "last_seen_at": user.last_seen_at.isoformat() if user.last_seen_at else None,
+        "last_seen_symbol": user.last_seen_symbol,
+        "mt5_account_id": user.mt5_account_id,
     })
 
 
@@ -470,7 +485,6 @@ def settings():
 
     data = request.get_json(silent=True) or {}
 
-    # accept "pairs" OR "pair"
     if "pairs" in data:
         try:
             user.pairs = normalize_pairs(str(data["pairs"]))
@@ -546,6 +560,33 @@ def settings():
     return status()
 
 
+# ✅ EA Heartbeat endpoint (EA calls this every ~60s)
+@app.post("/api/v1/heartbeat")
+@limiter.limit("120 per minute")
+def heartbeat():
+    user, err = require_api_key()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+
+    symbol = (data.get("symbol") or "").strip().upper()
+    mt5_account_id = str(data.get("mt5_account_id") or "").strip()[:64] or None
+
+    user.last_seen_at = datetime.now(timezone.utc)
+    user.last_seen_symbol = symbol[:20] if symbol else None
+    user.mt5_account_id = mt5_account_id
+
+    db.session.commit()
+
+    return jsonify({
+        "ok": True,
+        "last_seen_at": user.last_seen_at.isoformat(),
+        "last_seen_symbol": user.last_seen_symbol,
+        "mt5_account_id": user.mt5_account_id,
+    })
+
+
 # -------------------------
 # Billing routes (frontend uses X-API-Key)
 # -------------------------
@@ -575,13 +616,11 @@ def create_checkout_session():
     if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
         return json_error("Stripe not configured on server.", 500)
 
-    # Ensure a Stripe customer exists
     if not user.stripe_customer_id:
         cust = stripe.Customer.create(email=user.email, metadata={"user_id": str(user.id)})
         user.stripe_customer_id = cust["id"]
         db.session.commit()
 
-    # Start trial if they don't have one yet
     if not user.trial_ends_at:
         user.trial_ends_at = datetime.now(timezone.utc) + timedelta(days=TRIAL_DAYS)
         db.session.commit()
@@ -595,12 +634,8 @@ def create_checkout_session():
         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
         success_url=success_url,
         cancel_url=cancel_url,
-        subscription_data={
-            "trial_period_days": TRIAL_DAYS
-        },
-        metadata={
-            "user_id": str(user.id),
-        }
+        subscription_data={"trial_period_days": TRIAL_DAYS},
+        metadata={"user_id": str(user.id)},
     )
 
     return jsonify({"ok": True, "url": session.url})
@@ -649,7 +684,6 @@ def stripe_webhook():
     etype = event["type"]
     obj = event["data"]["object"]
 
-    # helper: update by customer id
     def get_user_by_customer(customer_id: str):
         if not customer_id:
             return None
@@ -662,14 +696,13 @@ def stripe_webhook():
         if user:
             user.stripe_subscription_id = subscription_id
             user.plan = "pro"
-            # checkout complete usually means subscription created; status may still be trialing/active
             user.subscription_status = "active"
             db.session.commit()
 
     if etype in ("customer.subscription.updated", "customer.subscription.created", "customer.subscription.deleted"):
         customer_id = obj.get("customer")
         subscription_id = obj.get("id")
-        status = obj.get("status")  # active, trialing, past_due, canceled, unpaid, etc.
+        status = obj.get("status")
 
         user = get_user_by_customer(customer_id)
         if user:
