@@ -25,7 +25,7 @@ FRONTEND_ORIGINS = ["https://676trades.org", "https://www.676trades.org"]
 CORS(
     app,
     resources={r"/*": {"origins": FRONTEND_ORIGINS}},
-    allow_headers=["Content-Type", "X-API-Key", "X-Admin-Token"],
+    allow_headers=["Content-Type", "X-API-Key", "X-Admin-Token", "Stripe-Signature"],
     methods=["GET", "POST", "OPTIONS"],
 )
 
@@ -35,9 +35,8 @@ limiter = Limiter(
     default_limits=["60 per minute"],
 )
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///db.sqlite3").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///db.sqlite3")
 
-# Normalize Postgres URLs and force psycopg v3
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -46,24 +45,22 @@ if DATABASE_URL.startswith("postgresql://"):
 
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
 db = SQLAlchemy(app)
+
 
 # -------------------------
 # Stripe config
 # -------------------------
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
-STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "").strip()  # must be price_...
+STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "").strip()   # must be price_...
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 APP_BASE_URL = os.getenv("APP_BASE_URL", "https://676trades.org").strip()
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "5"))
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
-
-# -------------------------
-# Admin config
-# -------------------------
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 
 
 # -------------------------
@@ -76,43 +73,46 @@ class User(db.Model):
 
     email = db.Column(db.String(255), unique=True, nullable=False, index=True)
     password_hash = db.Column(db.String(255), nullable=False)
+
     api_key = db.Column(db.String(64), unique=True, nullable=False, index=True)
 
     enabled = db.Column(db.Boolean, default=False, nullable=False)
 
-    # Trading (single + multi)
     pair = db.Column(db.String(20), default="XAUUSD", nullable=False)
     pairs = db.Column(db.String(255), default="XAUUSD", nullable=False)
+
     lot_size = db.Column(db.Float, default=0.01, nullable=False)
 
-    # SL/TP
-    sl_mode = db.Column(db.String(20), default="dynamic", nullable=False)  # dynamic | fixed
-    tp_mode = db.Column(db.String(20), default="rr", nullable=False)      # rr | pattern_mult | fixed
+    sl_mode = db.Column(db.String(20), default="dynamic", nullable=False)
+    tp_mode = db.Column(db.String(20), default="rr", nullable=False)
+
     min_pips = db.Column(db.Integer, default=50, nullable=False)
     sl_buffer_pips = db.Column(db.Integer, default=5, nullable=False)
+
     rr = db.Column(db.Float, default=1.0, nullable=False)
     pattern_tp_mult = db.Column(db.Float, default=1.5, nullable=False)
+
     fixed_sl_pips = db.Column(db.Integer, default=50, nullable=False)
     fixed_tp_pips = db.Column(db.Integer, default=50, nullable=False)
 
-    # Billing
-    plan = db.Column(db.String(20), default="free", nullable=False)  # free / pro
-    subscription_status = db.Column(db.String(30), default="none", nullable=False)  # none/active/past_due/canceled
+    # Billing fields
+    plan = db.Column(db.String(20), default="free", nullable=False)
+    subscription_status = db.Column(db.String(30), default="none", nullable=False)
     trial_ends_at = db.Column(db.DateTime, nullable=True)
+
     stripe_customer_id = db.Column(db.String(80), nullable=True, index=True)
     stripe_subscription_id = db.Column(db.String(80), nullable=True, index=True)
 
-    # Profile / timestamps
-    display_name = db.Column(db.String(80), nullable=True)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     last_login_at = db.Column(db.DateTime, nullable=True)
-    last_settings_at = db.Column(db.DateTime, nullable=True)
 
-    # EA heartbeat
+    # NEW: heartbeat + activity
     last_seen_at = db.Column(db.DateTime, nullable=True)
     last_seen_symbol = db.Column(db.String(20), nullable=True)
     last_seen_tf = db.Column(db.String(10), nullable=True)
     last_seen_ip = db.Column(db.String(64), nullable=True)
+
+    last_settings_at = db.Column(db.DateTime, nullable=True)
 
 
 class Trade(db.Model):
@@ -124,7 +124,7 @@ class Trade(db.Model):
     user = db.relationship("User", backref="trades")
 
     symbol = db.Column(db.String(20), nullable=False)
-    side = db.Column(db.String(10), nullable=False)  # BUY / SELL
+    side = db.Column(db.String(10), nullable=False)
 
     volume = db.Column(db.Float, nullable=False)
     entry = db.Column(db.Float, nullable=True)
@@ -194,6 +194,17 @@ def require_api_key():
     return user, None
 
 
+def require_admin():
+    if not ADMIN_TOKEN:
+        return None, json_error("Admin not configured on server.", 500)
+    tok = request.headers.get("X-Admin-Token", "").strip()
+    if not tok:
+        return None, json_error("Missing X-Admin-Token header", 401)
+    if tok != ADMIN_TOKEN:
+        return None, json_error("Invalid admin token", 401)
+    return True, None
+
+
 def trial_active(user: User) -> bool:
     if not user.trial_ends_at:
         return False
@@ -219,32 +230,22 @@ def ensure_can_trade(user: User):
     return json_error("Payment required. Please start your free trial / subscribe.", 402)
 
 
-def is_online(user: User, seconds: int = 45) -> bool:
+def online_from_last_seen(user: User, minutes: int = 5) -> bool:
     if not user.last_seen_at:
         return False
     now = datetime.now(timezone.utc)
     t = user.last_seen_at
     if t.tzinfo is None:
         t = t.replace(tzinfo=timezone.utc)
-    return (now - t).total_seconds() <= seconds
-
-
-def require_admin():
-    token = (request.headers.get("X-Admin-Token", "") or request.args.get("token", "")).strip()
-    if not ADMIN_TOKEN:
-        return json_error("Admin not configured (missing ADMIN_TOKEN)", 500)
-    if not token or token != ADMIN_TOKEN:
-        return json_error("Unauthorized", 401)
-    return None
+    return now - t <= timedelta(minutes=minutes)
 
 
 # -------------------------
-# Auto-migration
+# Auto-migration (Postgres safe)
 # -------------------------
 def ensure_schema():
     uri = app.config["SQLALCHEMY_DATABASE_URI"]
     is_postgres = uri.startswith("postgresql")
-
     if not is_postgres:
         db.create_all()
         return
@@ -260,8 +261,7 @@ def ensure_schema():
             """)).fetchall()
         }
 
-        def add_col(sql):
-            conn.execute(text(sql))
+        def add_col(sql): conn.execute(text(sql))
 
         # base
         if "email" not in cols:
@@ -274,14 +274,16 @@ def ensure_schema():
             add_col('CREATE UNIQUE INDEX IF NOT EXISTS ix_user_api_key ON "user"(api_key)')
         if "enabled" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT FALSE')
-
-        # trading
         if "pair" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN pair VARCHAR(20) NOT NULL DEFAULT \'XAUUSD\'')
         if "pairs" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN pairs VARCHAR(255) NOT NULL DEFAULT \'XAUUSD\'')
         if "lot_size" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN lot_size DOUBLE PRECISION NOT NULL DEFAULT 0.01')
+        if "created_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()')
+        if "last_login_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN last_login_at TIMESTAMPTZ NULL')
 
         # sl/tp
         if "sl_mode" not in cols:
@@ -315,17 +317,7 @@ def ensure_schema():
             add_col('ALTER TABLE "user" ADD COLUMN stripe_subscription_id VARCHAR(80) NULL')
             add_col('CREATE INDEX IF NOT EXISTS ix_user_stripe_subscription_id ON "user"(stripe_subscription_id)')
 
-        # profile/times
-        if "display_name" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN display_name VARCHAR(80) NULL')
-        if "created_at" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()')
-        if "last_login_at" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN last_login_at TIMESTAMPTZ NULL')
-        if "last_settings_at" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN last_settings_at TIMESTAMPTZ NULL')
-
-        # heartbeat
+        # NEW heartbeat/activity columns
         if "last_seen_at" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN last_seen_at TIMESTAMPTZ NULL')
         if "last_seen_symbol" not in cols:
@@ -334,6 +326,8 @@ def ensure_schema():
             add_col('ALTER TABLE "user" ADD COLUMN last_seen_tf VARCHAR(10) NULL')
         if "last_seen_ip" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN last_seen_ip VARCHAR(64) NULL')
+        if "last_settings_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN last_settings_at TIMESTAMPTZ NULL')
 
         # trade table
         conn.execute(text("""
@@ -369,7 +363,7 @@ def health():
 
 
 # -------------------------
-# Auth
+# Routes: Auth
 # -------------------------
 @app.post("/auth/register")
 @limiter.limit("10 per hour")
@@ -440,44 +434,33 @@ def rotate_key():
 
 
 # -------------------------
-# Account (for account2.html)
+# Routes: EA Heartbeat
 # -------------------------
-@app.get("/account/me")
-@limiter.limit("60 per minute")
-def account_me():
-    user, err = require_api_key()
-    if err:
-        return err
-
-    return jsonify({
-        "ok": True,
-        "email": user.email,
-        "display_name": user.display_name,
-        "created_at": user.created_at.isoformat() if user.created_at else None,
-        "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
-    })
-
-
-@app.post("/account/profile")
-@limiter.limit("30 per minute")
-def account_profile():
+@app.post("/api/v1/heartbeat")
+@limiter.limit("120 per minute")
+def heartbeat():
     user, err = require_api_key()
     if err:
         return err
 
     data = request.get_json(silent=True) or {}
-    display_name = (data.get("display_name") or "").strip()
-    if display_name and len(display_name) > 80:
-        return json_error("display_name too long", 400)
+    symbol = (data.get("symbol") or "").strip().upper()[:20] or None
+    tf = (data.get("tf") or "").strip().upper()[:10] or None
 
-    user.display_name = display_name if display_name else None
+    # IP best-effort (Render usually sets X-Forwarded-For)
+    ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "").split(",")[0].strip()[:64]
+
+    user.last_seen_at = datetime.now(timezone.utc)
+    user.last_seen_symbol = symbol
+    user.last_seen_tf = tf
+    user.last_seen_ip = ip
     db.session.commit()
 
     return jsonify({"ok": True})
 
 
 # -------------------------
-# EA + Dashboard control
+# Routes: Control (EA + Dashboard)
 # -------------------------
 @app.get("/api/v1/status")
 @limiter.limit("120 per minute")
@@ -491,8 +474,10 @@ def status():
     return jsonify({
         "ok": True,
         "enabled": bool(user.enabled),
+
         "pair": first_pair(pairs_csv),
         "pairs": pairs_csv,
+
         "lot_size": float(user.lot_size),
 
         "sl_mode": user.sl_mode,
@@ -504,17 +489,16 @@ def status():
         "fixed_sl_pips": int(user.fixed_sl_pips),
         "fixed_tp_pips": int(user.fixed_tp_pips),
 
+        # heartbeat snapshot
+        "online": online_from_last_seen(user, minutes=5),
+        "last_seen_at": user.last_seen_at.isoformat() if user.last_seen_at else None,
+        "last_seen_symbol": user.last_seen_symbol,
+        "last_seen_tf": user.last_seen_tf,
+
         # billing snapshot
         "plan": user.plan,
         "subscription_status": user.subscription_status,
         "trial_ends_at": user.trial_ends_at.isoformat() if user.trial_ends_at else None,
-        "trial_active": trial_active(user),
-
-        # heartbeat snapshot
-        "last_seen_at": user.last_seen_at.isoformat() if user.last_seen_at else None,
-        "last_seen_symbol": user.last_seen_symbol,
-        "last_seen_tf": user.last_seen_tf,
-        "online": is_online(user),
     })
 
 
@@ -631,29 +615,6 @@ def settings():
 
 
 # -------------------------
-# EA Heartbeat
-# -------------------------
-@app.post("/api/v1/heartbeat")
-@limiter.limit("240 per minute")
-def heartbeat():
-    user, err = require_api_key()
-    if err:
-        return err
-
-    data = request.get_json(silent=True) or {}
-    symbol = (data.get("symbol") or "").strip().upper()[:20]
-    tf = (data.get("tf") or "").strip().upper()[:10]
-
-    user.last_seen_at = datetime.now(timezone.utc)
-    user.last_seen_symbol = symbol if symbol else user.last_seen_symbol
-    user.last_seen_tf = tf if tf else user.last_seen_tf
-    user.last_seen_ip = request.headers.get("X-Forwarded-For", request.remote_addr) or user.last_seen_ip
-
-    db.session.commit()
-    return jsonify({"ok": True})
-
-
-# -------------------------
 # Billing routes
 # -------------------------
 @app.get("/billing/status")
@@ -729,9 +690,6 @@ def create_portal_session():
     return jsonify({"ok": True, "url": portal.url})
 
 
-# -------------------------
-# Stripe webhook
-# -------------------------
 @app.post("/stripe/webhook")
 def stripe_webhook():
     if not STRIPE_WEBHOOK_SECRET:
@@ -755,7 +713,7 @@ def stripe_webhook():
             return None
         return User.query.filter_by(stripe_customer_id=customer_id).first()
 
-    if etype == "checkout.session.completed":
+    if etype in ("checkout.session.completed",):
         customer_id = obj.get("customer")
         subscription_id = obj.get("subscription")
         user = get_user_by_customer(customer_id)
@@ -780,7 +738,6 @@ def stripe_webhook():
             elif status in ("past_due", "unpaid"):
                 user.subscription_status = "past_due"
                 user.plan = "free"
-                user.enabled = False
             else:
                 user.subscription_status = "canceled"
                 user.plan = "free"
@@ -792,7 +749,7 @@ def stripe_webhook():
 
 
 # -------------------------
-# Trades
+# Trades routes
 # -------------------------
 @app.post("/api/v1/trades")
 @limiter.limit("120 per minute")
@@ -867,21 +824,21 @@ def get_trades():
 # Admin endpoints
 # -------------------------
 @app.get("/admin/users")
+@limiter.limit("60 per minute")
 def admin_users():
-    auth_err = require_admin()
-    if auth_err:
-        return auth_err
+    ok, err = require_admin()
+    if err:
+        return err
 
     q = (request.args.get("q") or "").strip().lower()
+    limit = safe_int(request.args.get("limit", 200), 200)
+    limit = max(1, min(limit, 500))
 
-    users_q = User.query
+    query = User.query
     if q:
-        users_q = users_q.filter(User.email.ilike(f"%{q}%"))
+        query = query.filter(User.email.ilike(f"%{q}%"))
 
-    users = users_q.order_by(User.id.desc()).limit(500).all()
-
-    def iso(dt):
-        return dt.isoformat() if dt else None
+    users = query.order_by(User.id.desc()).limit(limit).all()
 
     items = []
     for u in users:
@@ -890,42 +847,34 @@ def admin_users():
             "email": u.email,
             "plan": u.plan,
             "subscription_status": u.subscription_status,
-            "trial_ends_at": iso(u.trial_ends_at),
-            "trial_active": trial_active(u),
             "enabled": bool(u.enabled),
             "pairs": u.pairs,
             "lot_size": float(u.lot_size),
-            "created_at": iso(u.created_at),
-            "last_login_at": iso(u.last_login_at),
-            "last_seen_at": iso(u.last_seen_at),
-            "last_seen_symbol": u.last_seen_symbol,
-            "last_seen_tf": u.last_seen_tf,
-            "online": is_online(u),
+            "online": online_from_last_seen(u, minutes=5),
+            "last_seen_at": u.last_seen_at.isoformat() if u.last_seen_at else None,
         })
 
     return jsonify({"ok": True, "items": items})
 
 
 @app.get("/admin/user/<int:user_id>/activity")
+@limiter.limit("60 per minute")
 def admin_user_activity(user_id: int):
-    auth_err = require_admin()
-    if auth_err:
-        return auth_err
+    ok, err = require_admin()
+    if err:
+        return err
 
     u = User.query.get(user_id)
     if not u:
         return json_error("User not found", 404)
 
-    rows = (
+    trades = (
         Trade.query
         .filter_by(user_id=u.id)
         .order_by(Trade.id.desc())
         .limit(50)
         .all()
     )
-
-    def iso(dt):
-        return dt.isoformat() if dt else None
 
     return jsonify({
         "ok": True,
@@ -934,32 +883,33 @@ def admin_user_activity(user_id: int):
             "email": u.email,
             "plan": u.plan,
             "subscription_status": u.subscription_status,
-            "trial_ends_at": iso(u.trial_ends_at),
             "enabled": bool(u.enabled),
             "pairs": u.pairs,
             "lot_size": float(u.lot_size),
-            "display_name": u.display_name,
-            "created_at": iso(u.created_at),
-            "last_login_at": iso(u.last_login_at),
-            "last_settings_at": iso(u.last_settings_at),
-            "last_seen_at": iso(u.last_seen_at),
+
+            "created_at": u.created_at.isoformat() if u.created_at else None,
+            "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None,
+            "last_settings_at": u.last_settings_at.isoformat() if u.last_settings_at else None,
+
+            "last_seen_at": u.last_seen_at.isoformat() if u.last_seen_at else None,
             "last_seen_symbol": u.last_seen_symbol,
             "last_seen_tf": u.last_seen_tf,
             "last_seen_ip": u.last_seen_ip,
         },
         "trades": [
             {
-                "id": r.id,
-                "symbol": r.symbol,
-                "side": r.side,
-                "volume": r.volume,
-                "entry": r.entry,
-                "sl": r.sl,
-                "tp": r.tp,
-                "profit": r.profit,
-                "opened_at": r.opened_at.isoformat(),
-                "deal_id": r.deal_id,
-            } for r in rows
+                "id": t.id,
+                "symbol": t.symbol,
+                "side": t.side,
+                "volume": t.volume,
+                "entry": t.entry,
+                "sl": t.sl,
+                "tp": t.tp,
+                "deal_id": t.deal_id,
+                "profit": t.profit,
+                "opened_at": t.opened_at.isoformat(),
+            }
+            for t in trades
         ]
     })
 
