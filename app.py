@@ -1,10 +1,8 @@
 import os
 import secrets
-import smtplib
-from email.message import EmailMessage
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, timedelta
 
-from flask import Flask, request, jsonify, abort
+from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -14,7 +12,6 @@ from sqlalchemy import text
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
-# Stripe (requires requirements.txt update)
 import stripe
 
 
@@ -23,22 +20,16 @@ import stripe
 # -------------------------
 app = Flask(__name__)
 
-# ---- CORS FIX (preflight + allow X-API-Key) ----
+FRONTEND_ORIGINS = ["https://676trades.org", "https://www.676trades.org"]
+
+# IMPORTANT: allow X-API-Key + Content-Type for CORS
 CORS(
     app,
-    resources={r"/*": {"origins": ["https://676trades.org", "https://www.676trades.org"]}},
-    allow_headers=["Content-Type", "X-API-Key", "Stripe-Signature"],
+    resources={r"/*": {"origins": FRONTEND_ORIGINS}},
+    allow_headers=["Content-Type", "X-API-Key"],
     methods=["GET", "POST", "OPTIONS"],
-    max_age=86400,
 )
 
-# Preflight handler (OPTIONS)
-@app.before_request
-def handle_preflight():
-    if request.method == "OPTIONS":
-        return ("", 200)
-
-# Rate limiting
 limiter = Limiter(
     get_remote_address,
     app=app,
@@ -47,7 +38,6 @@ limiter = Limiter(
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///db.sqlite3")
 
-# Normalize Postgres URLs and force psycopg v3
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -59,31 +49,17 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
 
-UTC = timezone.utc
-
-
 # -------------------------
-# Stripe config (env vars)
+# Stripe config
 # -------------------------
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
-STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "").strip()  # PRICE id, not product id
+STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "").strip()   # must be price_...
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
-STRIPE_SUCCESS_URL = os.getenv("STRIPE_SUCCESS_URL", "https://676trades.org/billing.html?success=1")
-STRIPE_CANCEL_URL = os.getenv("STRIPE_CANCEL_URL", "https://676trades.org/billing.html?canceled=1")
+APP_BASE_URL = os.getenv("APP_BASE_URL", "https://676trades.org").strip()  # frontend
+TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "5"))
 
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
-
-
-# -------------------------
-# Email config (env vars)
-# -------------------------
-MAIL_HOST = os.getenv("MAIL_HOST", "").strip()
-MAIL_PORT = int(os.getenv("MAIL_PORT", "587"))
-MAIL_USERNAME = os.getenv("MAIL_USERNAME", "").strip()
-MAIL_PASSWORD = os.getenv("MAIL_PASSWORD", "").strip()
-MAIL_FROM = os.getenv("MAIL_FROM", MAIL_USERNAME).strip()
-RESET_LINK_BASE = os.getenv("RESET_LINK_BASE", "https://676trades.org/reset.html").strip()
 
 
 # -------------------------
@@ -97,45 +73,40 @@ class User(db.Model):
     email = db.Column(db.String(255), unique=True, nullable=False, index=True)
     password_hash = db.Column(db.String(255), nullable=False)
 
-    # Long-lived key used by EA + dashboard (MVP)
     api_key = db.Column(db.String(64), unique=True, nullable=False, index=True)
 
     enabled = db.Column(db.Boolean, default=False, nullable=False)
 
     # Backward compatible single symbol
     pair = db.Column(db.String(20), default="XAUUSD", nullable=False)
-
-    # Multi symbols CSV: "XAUUSD,EURUSD,GBPUSD"
+    # Multi symbols CSV
     pairs = db.Column(db.String(255), default="XAUUSD", nullable=False)
 
     lot_size = db.Column(db.Float, default=0.01, nullable=False)
 
     # SL/TP settings
-    sl_mode = db.Column(db.String(20), default="dynamic", nullable=False)          # dynamic | fixed
-    tp_mode = db.Column(db.String(20), default="rr", nullable=False)              # rr | pattern_mult | fixed
+    sl_mode = db.Column(db.String(20), default="dynamic", nullable=False)
+    tp_mode = db.Column(db.String(20), default="rr", nullable=False)
+
     min_pips = db.Column(db.Integer, default=50, nullable=False)
     sl_buffer_pips = db.Column(db.Integer, default=5, nullable=False)
+
     rr = db.Column(db.Float, default=1.0, nullable=False)
     pattern_tp_mult = db.Column(db.Float, default=1.5, nullable=False)
+
     fixed_sl_pips = db.Column(db.Integer, default=50, nullable=False)
     fixed_tp_pips = db.Column(db.Integer, default=50, nullable=False)
 
-    # Password reset
-    reset_token = db.Column(db.String(128), nullable=True, index=True)
-    reset_token_expires_at = db.Column(db.DateTime, nullable=True)
-
-    # Profile fields
-    display_name = db.Column(db.String(80), nullable=True)
-    created_at = db.Column(db.DateTime, default=lambda: datetime.now(UTC), nullable=False)
-    last_login_at = db.Column(db.DateTime, nullable=True)
-
     # Billing fields
-    plan = db.Column(db.String(20), default="free", nullable=False)  # free/pro
-    subscription_status = db.Column(db.String(30), default="none", nullable=False)  # none/trialing/active/past_due/canceled
+    plan = db.Column(db.String(20), default="free", nullable=False)  # free / pro
+    subscription_status = db.Column(db.String(30), default="none", nullable=False)  # none/active/past_due/canceled
     trial_ends_at = db.Column(db.DateTime, nullable=True)
 
     stripe_customer_id = db.Column(db.String(80), nullable=True, index=True)
     stripe_subscription_id = db.Column(db.String(80), nullable=True, index=True)
+
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    last_login_at = db.Column(db.DateTime, nullable=True)
 
 
 class Trade(db.Model):
@@ -147,7 +118,7 @@ class Trade(db.Model):
     user = db.relationship("User", backref="trades")
 
     symbol = db.Column(db.String(20), nullable=False)
-    side = db.Column(db.String(10), nullable=False)  # BUY / SELL
+    side = db.Column(db.String(10), nullable=False)
 
     volume = db.Column(db.Float, nullable=False)
     entry = db.Column(db.Float, nullable=True)
@@ -157,7 +128,7 @@ class Trade(db.Model):
     deal_id = db.Column(db.String(64), nullable=True, index=True)
     profit = db.Column(db.Float, nullable=True)
 
-    opened_at = db.Column(db.DateTime, default=lambda: datetime.now(UTC), nullable=False)
+    opened_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 
 # -------------------------
@@ -165,18 +136,6 @@ class Trade(db.Model):
 # -------------------------
 def json_error(message: str, code: int = 400):
     return jsonify({"ok": False, "error": message}), code
-
-
-def require_api_key():
-    api_key = request.headers.get("X-API-Key", "").strip()
-    if not api_key:
-        return None, json_error("Missing X-API-Key header", 401)
-
-    user = User.query.filter_by(api_key=api_key).first()
-    if not user:
-        return None, json_error("Invalid API key", 401)
-
-    return user, None
 
 
 def safe_float(v, default=None):
@@ -217,57 +176,48 @@ def first_pair(pairs_csv: str) -> str:
         return "XAUUSD"
 
 
-def now_utc():
-    return datetime.now(UTC)
+def require_api_key():
+    api_key = request.headers.get("X-API-Key", "").strip()
+    if not api_key:
+        return None, json_error("Missing X-API-Key header", 401)
+
+    user = User.query.filter_by(api_key=api_key).first()
+    if not user:
+        return None, json_error("Invalid API key", 401)
+
+    return user, None
 
 
-def is_paid(user: User) -> bool:
-    # active OR trialing and not expired
-    if user.subscription_status == "active":
-        return True
-    if user.subscription_status == "trialing":
-        if user.trial_ends_at and user.trial_ends_at > now_utc():
-            return True
-    return False
-
-
-def enforce_paid_access(user: User):
-    """
-    If user is not paid/trialing, they cannot enable or change settings.
-    Also force enabled = False server-side.
-    """
-    if not is_paid(user):
-        if user.enabled:
-            user.enabled = False
-            db.session.commit()
+def trial_active(user: User) -> bool:
+    if not user.trial_ends_at:
         return False
-    return True
+    now = datetime.now(timezone.utc)
+    # user.trial_ends_at might be naive depending on DB; normalize
+    t = user.trial_ends_at
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return now < t
 
 
-def send_email(to_email: str, subject: str, body: str):
-    """
-    Basic SMTP sender (Gmail needs App Password).
-    Requires env: MAIL_HOST, MAIL_PORT, MAIL_USERNAME, MAIL_PASSWORD, MAIL_FROM
-    """
-    if not (MAIL_HOST and MAIL_USERNAME and MAIL_PASSWORD and MAIL_FROM):
-        # silently skip if email isn't configured
-        return False
+def is_paid_active(user: User) -> bool:
+    return user.subscription_status == "active"
 
-    msg = EmailMessage()
-    msg["From"] = MAIL_FROM
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg.set_content(body)
 
-    with smtplib.SMTP(MAIL_HOST, MAIL_PORT) as server:
-        server.starttls()
-        server.login(MAIL_USERNAME, MAIL_PASSWORD)
-        server.send_message(msg)
-    return True
+def ensure_can_trade(user: User):
+    # allow if paid active OR trial still active
+    if is_paid_active(user) or trial_active(user):
+        return None
+
+    # force disabled for unpaid
+    if user.enabled:
+        user.enabled = False
+        db.session.commit()
+
+    return json_error("Payment required. Please start your free trial / subscribe.", 402)
 
 
 # -------------------------
-# Auto-migration (no more resetting Postgres)
+# Auto-migration (keeps Postgres from breaking)
 # -------------------------
 def ensure_schema():
     uri = app.config["SQLALCHEMY_DATABASE_URI"]
@@ -280,16 +230,14 @@ def ensure_schema():
         conn.execute(text("""CREATE TABLE IF NOT EXISTS "user" (id SERIAL PRIMARY KEY)"""))
 
         cols = {
-            r[0]
-            for r in conn.execute(text("""
+            r[0] for r in conn.execute(text("""
                 SELECT column_name
                 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='user'
             """)).fetchall()
         }
 
-        def add_col(sql: str):
-            conn.execute(text(sql))
+        def add_col(sql): conn.execute(text(sql))
 
         # base
         if "email" not in cols:
@@ -308,6 +256,10 @@ def ensure_schema():
             add_col('ALTER TABLE "user" ADD COLUMN pairs VARCHAR(255) NOT NULL DEFAULT \'XAUUSD\'')
         if "lot_size" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN lot_size DOUBLE PRECISION NOT NULL DEFAULT 0.01')
+        if "created_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()')
+        if "last_login_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN last_login_at TIMESTAMPTZ NULL')
 
         # sl/tp
         if "sl_mode" not in cols:
@@ -327,33 +279,18 @@ def ensure_schema():
         if "fixed_tp_pips" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN fixed_tp_pips INTEGER NOT NULL DEFAULT 50')
 
-        # reset
-        if "reset_token" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN reset_token VARCHAR(128)')
-            add_col('CREATE INDEX IF NOT EXISTS ix_user_reset_token ON "user"(reset_token)')
-        if "reset_token_expires_at" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN reset_token_expires_at TIMESTAMPTZ')
-
-        # profile
-        if "display_name" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN display_name VARCHAR(80)')
-        if "created_at" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()')
-        if "last_login_at" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN last_login_at TIMESTAMPTZ')
-
         # billing
         if "plan" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN plan VARCHAR(20) NOT NULL DEFAULT \'free\'')
         if "subscription_status" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN subscription_status VARCHAR(30) NOT NULL DEFAULT \'none\'')
         if "trial_ends_at" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN trial_ends_at TIMESTAMPTZ')
+            add_col('ALTER TABLE "user" ADD COLUMN trial_ends_at TIMESTAMPTZ NULL')
         if "stripe_customer_id" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN stripe_customer_id VARCHAR(80)')
+            add_col('ALTER TABLE "user" ADD COLUMN stripe_customer_id VARCHAR(80) NULL')
             add_col('CREATE INDEX IF NOT EXISTS ix_user_stripe_customer_id ON "user"(stripe_customer_id)')
         if "stripe_subscription_id" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN stripe_subscription_id VARCHAR(80)')
+            add_col('ALTER TABLE "user" ADD COLUMN stripe_subscription_id VARCHAR(80) NULL')
             add_col('CREATE INDEX IF NOT EXISTS ix_user_stripe_subscription_id ON "user"(stripe_subscription_id)')
 
         # trade table
@@ -412,9 +349,8 @@ def register():
         pair="XAUUSD",
         pairs="XAUUSD",
         lot_size=0.01,
-        subscription_status="trialing",               # start trial on register (optional)
-        trial_ends_at=now_utc() + timedelta(days=5),  # 5-day trial
-        plan="pro",                                   # trial of pro features
+        plan="free",
+        subscription_status="none",
     )
 
     try:
@@ -438,7 +374,7 @@ def login():
     if not user or not check_password_hash(user.password_hash, password):
         return json_error("Invalid email or password", 401)
 
-    user.last_login_at = now_utc()
+    user.last_login_at = datetime.now(timezone.utc)
     db.session.commit()
 
     return jsonify({"ok": True, "api_key": user.api_key})
@@ -461,63 +397,6 @@ def rotate_key():
     return jsonify({"ok": True, "api_key": user.api_key})
 
 
-# ---- Password reset ----
-@app.post("/auth/forgot-password")
-@limiter.limit("10 per hour")
-def forgot_password():
-    data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
-    if not email:
-        return json_error("Email required", 400)
-
-    user = User.query.filter_by(email=email).first()
-
-    # Always return ok (prevents email enumeration)
-    if not user:
-        return jsonify({"ok": True})
-
-    token = secrets.token_urlsafe(32)
-    user.reset_token = token
-    user.reset_token_expires_at = now_utc() + timedelta(minutes=30)
-    db.session.commit()
-
-    link = f"{RESET_LINK_BASE}?token={token}"
-    body = (
-        "You requested a password reset for 676Trades.\n\n"
-        f"Reset your password here:\n{link}\n\n"
-        "This link expires in 30 minutes.\n"
-        "If you did not request this, ignore this email.\n"
-    )
-    send_email(user.email, "676Trades Password Reset", body)
-
-    return jsonify({"ok": True})
-
-
-@app.post("/auth/reset-password")
-@limiter.limit("10 per hour")
-def reset_password():
-    data = request.get_json(silent=True) or {}
-    token = (data.get("token") or "").strip()
-    new_password = (data.get("password") or "").strip()
-
-    if not token or not new_password:
-        return json_error("token and password required", 400)
-
-    user = User.query.filter_by(reset_token=token).first()
-    if not user:
-        return json_error("Invalid or expired token", 400)
-
-    if not user.reset_token_expires_at or user.reset_token_expires_at < now_utc():
-        return json_error("Invalid or expired token", 400)
-
-    user.password_hash = generate_password_hash(new_password)
-    user.reset_token = None
-    user.reset_token_expires_at = None
-    db.session.commit()
-
-    return jsonify({"ok": True})
-
-
 # -------------------------
 # Routes: Control (EA + Dashboard)
 # -------------------------
@@ -528,14 +407,11 @@ def status():
     if err:
         return err
 
-    # Payment enforcement: if not paid -> force enabled false
-    paid_ok = enforce_paid_access(user)
-
     pairs_csv = (user.pairs or user.pair or "XAUUSD").strip() or "XAUUSD"
 
     return jsonify({
         "ok": True,
-        "enabled": bool(user.enabled) if paid_ok else False,
+        "enabled": bool(user.enabled),
 
         "pair": first_pair(pairs_csv),
         "pairs": pairs_csv,
@@ -551,7 +427,7 @@ def status():
         "fixed_sl_pips": int(user.fixed_sl_pips),
         "fixed_tp_pips": int(user.fixed_tp_pips),
 
-        # billing snapshot for UI
+        # billing snapshot
         "plan": user.plan,
         "subscription_status": user.subscription_status,
         "trial_ends_at": user.trial_ends_at.isoformat() if user.trial_ends_at else None,
@@ -565,8 +441,9 @@ def toggle():
     if err:
         return err
 
-    if not enforce_paid_access(user):
-        return json_error("Payment required. Please subscribe.", 402)
+    pay_err = ensure_can_trade(user)
+    if pay_err:
+        return pay_err
 
     data = request.get_json(silent=True) or {}
     enabled = data.get("enabled", None)
@@ -587,12 +464,13 @@ def settings():
     if err:
         return err
 
-    if not enforce_paid_access(user):
-        return json_error("Payment required. Please subscribe.", 402)
+    pay_err = ensure_can_trade(user)
+    if pay_err:
+        return pay_err
 
     data = request.get_json(silent=True) or {}
 
-    # pairs
+    # accept "pairs" OR "pair"
     if "pairs" in data:
         try:
             user.pairs = normalize_pairs(str(data["pairs"]))
@@ -608,7 +486,6 @@ def settings():
         except ValueError as e:
             return json_error(str(e), 400)
 
-    # lot size
     if "lot_size" in data:
         lot = safe_float(data["lot_size"])
         if lot is None:
@@ -617,7 +494,6 @@ def settings():
             return json_error("lot_size out of range", 400)
         user.lot_size = lot
 
-    # sl/tp
     if "sl_mode" in data:
         sl_mode = str(data["sl_mode"]).strip().lower()
         if sl_mode not in ("dynamic", "fixed"):
@@ -671,7 +547,152 @@ def settings():
 
 
 # -------------------------
-# Routes: Trades
+# Billing routes (frontend uses X-API-Key)
+# -------------------------
+@app.get("/billing/status")
+@limiter.limit("60 per minute")
+def billing_status():
+    user, err = require_api_key()
+    if err:
+        return err
+
+    return jsonify({
+        "ok": True,
+        "plan": user.plan,
+        "subscription_status": user.subscription_status,
+        "trial_ends_at": user.trial_ends_at.isoformat() if user.trial_ends_at else None,
+        "trial_active": trial_active(user),
+    })
+
+
+@app.post("/billing/create-checkout-session")
+@limiter.limit("20 per hour")
+def create_checkout_session():
+    user, err = require_api_key()
+    if err:
+        return err
+
+    if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
+        return json_error("Stripe not configured on server.", 500)
+
+    # Ensure a Stripe customer exists
+    if not user.stripe_customer_id:
+        cust = stripe.Customer.create(email=user.email, metadata={"user_id": str(user.id)})
+        user.stripe_customer_id = cust["id"]
+        db.session.commit()
+
+    # Start trial if they don't have one yet
+    if not user.trial_ends_at:
+        user.trial_ends_at = datetime.now(timezone.utc) + timedelta(days=TRIAL_DAYS)
+        db.session.commit()
+
+    success_url = f"{APP_BASE_URL}/billing.html?success=1"
+    cancel_url = f"{APP_BASE_URL}/billing.html?canceled=1"
+
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        customer=user.stripe_customer_id,
+        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        success_url=success_url,
+        cancel_url=cancel_url,
+        subscription_data={
+            "trial_period_days": TRIAL_DAYS
+        },
+        metadata={
+            "user_id": str(user.id),
+        }
+    )
+
+    return jsonify({"ok": True, "url": session.url})
+
+
+@app.post("/billing/create-portal-session")
+@limiter.limit("30 per hour")
+def create_portal_session():
+    user, err = require_api_key()
+    if err:
+        return err
+
+    if not STRIPE_SECRET_KEY:
+        return json_error("Stripe not configured on server.", 500)
+
+    if not user.stripe_customer_id:
+        return json_error("No Stripe customer found for this user.", 400)
+
+    return_url = f"{APP_BASE_URL}/billing.html"
+
+    portal = stripe.billing_portal.Session.create(
+        customer=user.stripe_customer_id,
+        return_url=return_url,
+    )
+    return jsonify({"ok": True, "url": portal.url})
+
+
+# -------------------------
+# Stripe webhook
+# -------------------------
+@app.post("/stripe/webhook")
+def stripe_webhook():
+    if not STRIPE_WEBHOOK_SECRET:
+        return json_error("Webhook not configured.", 500)
+
+    payload = request.data
+    sig_header = request.headers.get("Stripe-Signature", "")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload=payload, sig_header=sig_header, secret=STRIPE_WEBHOOK_SECRET
+        )
+    except Exception:
+        return json_error("Invalid webhook signature.", 400)
+
+    etype = event["type"]
+    obj = event["data"]["object"]
+
+    # helper: update by customer id
+    def get_user_by_customer(customer_id: str):
+        if not customer_id:
+            return None
+        return User.query.filter_by(stripe_customer_id=customer_id).first()
+
+    if etype in ("checkout.session.completed",):
+        customer_id = obj.get("customer")
+        subscription_id = obj.get("subscription")
+        user = get_user_by_customer(customer_id)
+        if user:
+            user.stripe_subscription_id = subscription_id
+            user.plan = "pro"
+            # checkout complete usually means subscription created; status may still be trialing/active
+            user.subscription_status = "active"
+            db.session.commit()
+
+    if etype in ("customer.subscription.updated", "customer.subscription.created", "customer.subscription.deleted"):
+        customer_id = obj.get("customer")
+        subscription_id = obj.get("id")
+        status = obj.get("status")  # active, trialing, past_due, canceled, unpaid, etc.
+
+        user = get_user_by_customer(customer_id)
+        if user:
+            user.stripe_subscription_id = subscription_id
+
+            if status in ("active", "trialing"):
+                user.subscription_status = "active"
+                user.plan = "pro"
+            elif status in ("past_due", "unpaid"):
+                user.subscription_status = "past_due"
+                user.plan = "free"
+            else:
+                user.subscription_status = "canceled"
+                user.plan = "free"
+                user.enabled = False
+
+            db.session.commit()
+
+    return jsonify({"ok": True})
+
+
+# -------------------------
+# Trades routes (unchanged)
 # -------------------------
 @app.post("/api/v1/trades")
 @limiter.limit("120 per minute")
@@ -743,117 +764,6 @@ def get_trades():
 
 
 # -------------------------
-# Billing: Stripe
-# -------------------------
-@app.get("/billing/status")
-@limiter.limit("60 per minute")
-def billing_status():
-    user, err = require_api_key()
-    if err:
-        return err
-
-    return jsonify({
-        "ok": True,
-        "plan": user.plan,
-        "subscription_status": user.subscription_status,
-        "trial_ends_at": user.trial_ends_at.isoformat() if user.trial_ends_at else None,
-    })
-
-
-@app.post("/billing/create-checkout-session")
-@limiter.limit("30 per minute")
-def billing_create_checkout_session():
-    user, err = require_api_key()
-    if err:
-        return err
-
-    if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
-        return json_error("Stripe not configured on server.", 500)
-
-    # Create customer once
-    if not user.stripe_customer_id:
-        customer = stripe.Customer.create(email=user.email)
-        user.stripe_customer_id = customer["id"]
-        db.session.commit()
-
-    # Create subscription checkout (trial is set on the Price/Subscription settings or here)
-    session = stripe.checkout.Session.create(
-        mode="subscription",
-        customer=user.stripe_customer_id,
-        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
-        success_url=STRIPE_SUCCESS_URL,
-        cancel_url=STRIPE_CANCEL_URL,
-        allow_promotion_codes=True,
-    )
-
-    return jsonify({"ok": True, "url": session["url"]})
-
-
-@app.post("/billing/create-portal-session")
-@limiter.limit("30 per minute")
-def billing_create_portal_session():
-    user, err = require_api_key()
-    if err:
-        return err
-
-    if not STRIPE_SECRET_KEY:
-        return json_error("Stripe not configured on server.", 500)
-
-    if not user.stripe_customer_id:
-        return json_error("No Stripe customer for this account.", 400)
-
-    session = stripe.billing_portal.Session.create(
-        customer=user.stripe_customer_id,
-        return_url="https://676trades.org/billing.html",
-    )
-    return jsonify({"ok": True, "url": session["url"]})
-
-
-@app.post("/billing/webhook")
-def stripe_webhook():
-    if not STRIPE_WEBHOOK_SECRET:
-        abort(400)
-
-    payload = request.data
-    sig_header = request.headers.get("Stripe-Signature", "")
-
-    try:
-        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-    except Exception:
-        abort(400)
-
-    event_type = event["type"]
-    data = event["data"]["object"]
-
-    # Subscription events
-    if event_type in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
-        customer_id = data.get("customer")
-        sub_id = data.get("id")
-        status = data.get("status")  # active, trialing, past_due, canceled, etc.
-
-        user = User.query.filter_by(stripe_customer_id=customer_id).first()
-        if user:
-            user.stripe_subscription_id = sub_id
-            user.subscription_status = status
-
-            # If Stripe provides trial_end, store it
-            trial_end = data.get("trial_end")
-            if trial_end:
-                user.trial_ends_at = datetime.fromtimestamp(trial_end, tz=UTC)
-
-            # Plan mapping
-            if status in ("active", "trialing"):
-                user.plan = "pro"
-            else:
-                user.plan = "free"
-                user.enabled = False
-
-            db.session.commit()
-
-    return jsonify({"ok": True})
-
-
-# -------------------------
 # Security headers
 # -------------------------
 @app.after_request
@@ -873,7 +783,7 @@ with app.app_context():
 
 
 # -------------------------
-# Local run (Render uses gunicorn)
+# Local run
 # -------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
