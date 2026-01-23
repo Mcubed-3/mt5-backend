@@ -61,6 +61,11 @@ TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "5"))
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
+# -------------------------
+# Admin token
+# -------------------------
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+
 
 # -------------------------
 # Models
@@ -108,10 +113,9 @@ class User(db.Model):
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     last_login_at = db.Column(db.DateTime, nullable=True)
 
-    # ✅ EA Heartbeat fields
+    # EA heartbeat
     last_seen_at = db.Column(db.DateTime, nullable=True)
     last_seen_symbol = db.Column(db.String(20), nullable=True)
-    mt5_account_id = db.Column(db.String(64), nullable=True)
 
 
 class Trade(db.Model):
@@ -193,6 +197,13 @@ def require_api_key():
     return user, None
 
 
+def require_admin():
+    token = request.args.get("token", "")
+    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+        return json_error("Forbidden", 403)
+    return None
+
+
 def trial_active(user: User) -> bool:
     if not user.trial_ends_at:
         return False
@@ -216,6 +227,16 @@ def ensure_can_trade(user: User):
         db.session.commit()
 
     return json_error("Payment required. Please start your free trial / subscribe.", 402)
+
+
+def ea_connected(user: User) -> bool:
+    if not user.last_seen_at:
+        return False
+    now = datetime.now(timezone.utc)
+    t = user.last_seen_at
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return (now - t) <= timedelta(minutes=5)
 
 
 # -------------------------
@@ -263,14 +284,6 @@ def ensure_schema():
         if "last_login_at" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN last_login_at TIMESTAMPTZ NULL')
 
-        # ✅ heartbeat columns
-        if "last_seen_at" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN last_seen_at TIMESTAMPTZ NULL')
-        if "last_seen_symbol" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN last_seen_symbol VARCHAR(20) NULL')
-        if "mt5_account_id" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN mt5_account_id VARCHAR(64) NULL')
-
         # sl/tp
         if "sl_mode" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN sl_mode VARCHAR(20) NOT NULL DEFAULT \'dynamic\'')
@@ -302,6 +315,12 @@ def ensure_schema():
         if "stripe_subscription_id" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN stripe_subscription_id VARCHAR(80) NULL')
             add_col('CREATE INDEX IF NOT EXISTS ix_user_stripe_subscription_id ON "user"(stripe_subscription_id)')
+
+        # heartbeat
+        if "last_seen_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN last_seen_at TIMESTAMPTZ NULL')
+        if "last_seen_symbol" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN last_seen_symbol VARCHAR(20) NULL')
 
         # trade table
         conn.execute(text("""
@@ -442,10 +461,10 @@ def status():
         "subscription_status": user.subscription_status,
         "trial_ends_at": user.trial_ends_at.isoformat() if user.trial_ends_at else None,
 
-        # ✅ heartbeat snapshot
+        # heartbeat snapshot
         "last_seen_at": user.last_seen_at.isoformat() if user.last_seen_at else None,
         "last_seen_symbol": user.last_seen_symbol,
-        "mt5_account_id": user.mt5_account_id,
+        "ea_connected": ea_connected(user),
     })
 
 
@@ -560,7 +579,9 @@ def settings():
     return status()
 
 
-# ✅ EA Heartbeat endpoint (EA calls this every ~60s)
+# -------------------------
+# EA Heartbeat (EA calls this)
+# -------------------------
 @app.post("/api/v1/heartbeat")
 @limiter.limit("120 per minute")
 def heartbeat():
@@ -569,22 +590,13 @@ def heartbeat():
         return err
 
     data = request.get_json(silent=True) or {}
-
-    symbol = (data.get("symbol") or "").strip().upper()
-    mt5_account_id = str(data.get("mt5_account_id") or "").strip()[:64] or None
+    symbol = (data.get("symbol") or "").strip().upper()[:20] or None
 
     user.last_seen_at = datetime.now(timezone.utc)
-    user.last_seen_symbol = symbol[:20] if symbol else None
-    user.mt5_account_id = mt5_account_id
-
+    user.last_seen_symbol = symbol
     db.session.commit()
 
-    return jsonify({
-        "ok": True,
-        "last_seen_at": user.last_seen_at.isoformat(),
-        "last_seen_symbol": user.last_seen_symbol,
-        "mt5_account_id": user.mt5_account_id,
-    })
+    return jsonify({"ok": True})
 
 
 # -------------------------
@@ -714,6 +726,7 @@ def stripe_webhook():
             elif status in ("past_due", "unpaid"):
                 user.subscription_status = "past_due"
                 user.plan = "free"
+                user.enabled = False
             else:
                 user.subscription_status = "canceled"
                 user.plan = "free"
@@ -725,7 +738,7 @@ def stripe_webhook():
 
 
 # -------------------------
-# Trades routes (unchanged)
+# Trades routes
 # -------------------------
 @app.post("/api/v1/trades")
 @limiter.limit("120 per minute")
@@ -793,6 +806,138 @@ def get_trades():
             }
             for r in rows
         ]
+    })
+
+
+# -------------------------
+# Account routes (used by account2.html)
+# -------------------------
+@app.get("/account/me")
+@limiter.limit("60 per minute")
+def account_me():
+    user, err = require_api_key()
+    if err:
+        return err
+
+    return jsonify({
+        "ok": True,
+        "email": user.email,
+        "display_name": None,  # you can add this later if you want a display_name column
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
+        "last_seen_at": user.last_seen_at.isoformat() if user.last_seen_at else None,
+        "last_seen_symbol": user.last_seen_symbol,
+        "ea_connected": ea_connected(user),
+    })
+
+
+@app.post("/account/profile")
+@limiter.limit("30 per minute")
+def account_profile():
+    # Keeping endpoint for your existing UI
+    # (If you later add display_name column, store it here.)
+    user, err = require_api_key()
+    if err:
+        return err
+    return jsonify({"ok": True})
+
+
+# -------------------------
+# Admin routes (PRIVATE)
+# -------------------------
+@app.get("/admin/users")
+def admin_users():
+    err = require_admin()
+    if err:
+        return err
+
+    users = User.query.order_by(User.id.desc()).all()
+
+    return jsonify({
+        "ok": True,
+        "items": [
+            {
+                "id": u.id,
+                "email": u.email,
+                "plan": u.plan,
+                "subscription_status": u.subscription_status,
+                "enabled": u.enabled,
+                "trial_ends_at": u.trial_ends_at.isoformat() if u.trial_ends_at else None,
+                "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None,
+                "last_seen_at": u.last_seen_at.isoformat() if u.last_seen_at else None,
+                "last_seen_symbol": u.last_seen_symbol,
+                "ea_connected": ea_connected(u),
+            }
+            for u in users
+        ]
+    })
+
+
+@app.get("/admin/user/<int:user_id>/activity")
+def admin_user_activity(user_id):
+    err = require_admin()
+    if err:
+        return err
+
+    user = User.query.get_or_404(user_id)
+
+    trades = (
+        Trade.query
+        .filter_by(user_id=user.id)
+        .order_by(Trade.id.desc())
+        .limit(50)
+        .all()
+    )
+
+    return jsonify({
+        "ok": True,
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "plan": user.plan,
+            "subscription_status": user.subscription_status,
+            "enabled": user.enabled,
+            "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
+            "last_seen_at": user.last_seen_at.isoformat() if user.last_seen_at else None,
+            "last_seen_symbol": user.last_seen_symbol,
+            "ea_connected": ea_connected(user),
+        },
+        "trades": [
+            {
+                "id": t.id,
+                "symbol": t.symbol,
+                "side": t.side,
+                "volume": t.volume,
+                "profit": t.profit,
+                "opened_at": t.opened_at.isoformat(),
+            }
+            for t in trades
+        ]
+    })
+
+
+@app.get("/admin/metrics")
+def admin_metrics():
+    err = require_admin()
+    if err:
+        return err
+
+    now = datetime.now(timezone.utc)
+    five_min_ago = now - timedelta(minutes=5)
+
+    return jsonify({
+        "ok": True,
+        "users_total": User.query.count(),
+        "subscriptions_active": User.query.filter_by(subscription_status="active").count(),
+        "trials_active": User.query.filter(
+            User.trial_ends_at.isnot(None),
+            User.trial_ends_at > now
+        ).count(),
+        "ea_connected_now": User.query.filter(
+            User.last_seen_at.isnot(None),
+            User.last_seen_at > five_min_ago
+        ).count(),
+        "algo_enabled": User.query.filter_by(enabled=True).count(),
     })
 
 
