@@ -168,6 +168,24 @@ class Trade(db.Model):
     opened_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 
+class AuditLog(db.Model):
+    __tablename__ = "audit_log"
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    # who performed the action (admin)
+    actor_ip = db.Column(db.String(64), nullable=True)
+
+    # which user was targeted
+    target_user_id = db.Column(db.Integer, nullable=True, index=True)
+
+    # what happened
+    action = db.Column(db.String(64), nullable=False)
+    meta_json = db.Column(db.Text, nullable=True)
+
+
 # -------------------------
 # Helpers
 # -------------------------
@@ -231,6 +249,21 @@ def client_ip():
     if xff:
         return xff
     return request.remote_addr or ""
+
+
+def write_audit(action: str, target_user_id=None, meta: dict = None):
+    try:
+        a = AuditLog(
+            actor_ip=(client_ip() or "")[:64],
+            target_user_id=target_user_id,
+            action=action[:64],
+            meta_json=json.dumps(meta or {}, separators=(",", ":")) if meta else None,
+        )
+        db.session.add(a)
+        db.session.commit()
+    except Exception:
+        # never block critical admin actions because audit write failed
+        db.session.rollback()
 
 
 # -------------------------
@@ -487,6 +520,19 @@ def ensure_schema():
         conn.execute(text('CREATE INDEX IF NOT EXISTS ix_trade_user_id ON trade(user_id)'))
         conn.execute(text('CREATE INDEX IF NOT EXISTS ix_trade_deal_id ON trade(deal_id)'))
 
+        # audit table
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id SERIAL PRIMARY KEY,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                actor_ip VARCHAR(64) NULL,
+                target_user_id INTEGER NULL,
+                action VARCHAR(64) NOT NULL,
+                meta_json TEXT NULL
+            )
+        """))
+        conn.execute(text('CREATE INDEX IF NOT EXISTS ix_audit_target_user_id ON audit_log(target_user_id)'))
+
 
 # -------------------------
 # Preflight helper (OPTIONS)
@@ -501,7 +547,7 @@ def any_options(_any):
 # -------------------------
 @app.get("/")
 def root():
-    return jsonify({"ok": True, "service": "mt5-control-backend", "version": "v2-jwt-admin"})
+    return jsonify({"ok": True, "service": "mt5-control-backend", "version": "v2-jwt-admin-audit"})
 
 
 @app.get("/health")
@@ -568,7 +614,6 @@ def login():
 
 @app.post("/auth/logout-all")
 def logout_all():
-    # user-triggered "force logout" (increments token_version)
     user, err = require_jwt()
     if err:
         return err
@@ -581,7 +626,6 @@ def logout_all():
 @app.post("/auth/rotate-key")
 @limiter.limit("10 per hour")
 def rotate_key_user():
-    # keep your existing behavior but require JWT instead of password
     user, err = require_jwt()
     if err:
         return err
@@ -593,7 +637,6 @@ def rotate_key_user():
 
 # -------------------------
 # Routes: Control (EA + Dashboard)
-# Dashboard uses JWT; EA uses X-API-Key
 # -------------------------
 @app.get("/api/v1/status")
 @limiter.limit("120 per minute")
@@ -603,7 +646,7 @@ def status():
     if err:
         user, err2 = require_jwt()
         if err2:
-            return err  # original "Invalid API key" for EA-like callers
+            return err
 
     pairs_csv = (user.pairs or user.pair or "XAUUSD").strip() or "XAUUSD"
     online = ea_connected(user, minutes=5)
@@ -625,16 +668,13 @@ def status():
         "fixed_sl_pips": int(user.fixed_sl_pips),
         "fixed_tp_pips": int(user.fixed_tp_pips),
 
-        # billing snapshot
         "plan": user.plan,
         "subscription_status": user.subscription_status,
         "trial_ends_at": dt_iso(user.trial_ends_at),
 
-        # heartbeat snapshot
         "ea_connected": bool(online),
         "last_seen_at": dt_iso(user.last_seen_at),
 
-        # optional risk ack
         "risk_ack_at": dt_iso(user.risk_ack_at),
     })
 
@@ -675,7 +715,6 @@ def settings():
 
     data = request.get_json(silent=True) or {}
 
-    # accept "pairs" OR "pair"
     if "pairs" in data:
         try:
             user.pairs = normalize_pairs(str(data["pairs"]))
@@ -747,7 +786,6 @@ def settings():
             return json_error("fixed_tp_pips out of range", 400)
         user.fixed_tp_pips = v
 
-    # optional: risk ack
     if data.get("risk_ack", False):
         user.risk_ack_at = now_utc()
 
@@ -770,7 +808,7 @@ def heartbeat():
     user.last_seen_at = now_utc()
     user.last_seen_symbol = (data.get("symbol") or "").strip().upper()[:20] or user.last_seen_symbol
     user.last_seen_tf = (data.get("tf") or "").strip().upper()[:10] or user.last_seen_tf
-    user.last_seen_ip = client_ip()[:64] or user.last_seen_ip
+    user.last_seen_ip = (client_ip() or "")[:64] or user.last_seen_ip
     db.session.commit()
     return jsonify({"ok": True})
 
@@ -913,7 +951,7 @@ def stripe_webhook():
 
 
 # -------------------------
-# Trades routes (EA can post with X-API-Key; website can read with JWT)
+# Trades routes
 # -------------------------
 @app.post("/api/v1/trades")
 @limiter.limit("120 per minute")
@@ -1074,6 +1112,7 @@ def admin_user_activity(user_id: int):
     })
 
 
+# Backwards compatible route name
 @app.post("/admin/user/<int:user_id>/force-enabled")
 def admin_force_enabled(user_id: int):
     ok, err = require_admin()
@@ -1087,9 +1126,23 @@ def admin_force_enabled(user_id: int):
     if not u:
         return json_error("User not found", 404)
 
+    before = bool(u.enabled)
     u.enabled = enabled
     db.session.commit()
+
+    write_audit(
+        "admin_force_toggle",
+        target_user_id=u.id,
+        meta={"before": before, "after": bool(u.enabled)},
+    )
+
     return jsonify({"ok": True, "enabled": bool(u.enabled)})
+
+
+# Preferred alias route (clean naming)
+@app.post("/admin/user/<int:user_id>/force-toggle")
+def admin_force_toggle(user_id: int):
+    return admin_force_enabled(user_id)
 
 
 @app.post("/admin/user/<int:user_id>/rotate-api-key")
@@ -1102,8 +1155,12 @@ def admin_rotate_api_key(user_id: int):
     if not u:
         return json_error("User not found", 404)
 
+    before = u.api_key
     u.api_key = secrets.token_hex(24)
     db.session.commit()
+
+    write_audit("admin_rotate_api_key", target_user_id=u.id, meta={"before_last6": before[-6:], "after_last6": u.api_key[-6:]})
+
     return jsonify({"ok": True, "api_key": u.api_key})
 
 
@@ -1126,6 +1183,8 @@ def admin_override_billing(user_id: int):
     if sub and sub not in ("none", "active", "past_due", "canceled"):
         return json_error("subscription_status invalid", 400)
 
+    before = {"plan": u.plan, "subscription_status": u.subscription_status, "enabled": bool(u.enabled)}
+
     if plan:
         u.plan = plan
     if sub:
@@ -1135,6 +1194,10 @@ def admin_override_billing(user_id: int):
         u.enabled = False
 
     db.session.commit()
+
+    after = {"plan": u.plan, "subscription_status": u.subscription_status, "enabled": bool(u.enabled)}
+    write_audit("admin_override_billing", target_user_id=u.id, meta={"before": before, "after": after})
+
     return jsonify({"ok": True})
 
 
@@ -1149,6 +1212,7 @@ def admin_override_settings(user_id: int):
         return json_error("User not found", 404)
 
     data = request.get_json(silent=True) or {}
+    before = {"pairs": u.pairs, "lot_size": float(u.lot_size)}
 
     if "pairs" in data:
         try:
@@ -1165,6 +1229,10 @@ def admin_override_settings(user_id: int):
 
     u.last_settings_at = now_utc()
     db.session.commit()
+
+    after = {"pairs": u.pairs, "lot_size": float(u.lot_size)}
+    write_audit("admin_override_settings", target_user_id=u.id, meta={"before": before, "after": after})
+
     return jsonify({"ok": True})
 
 
@@ -1178,9 +1246,74 @@ def admin_force_logout(user_id: int):
     if not u:
         return json_error("User not found", 404)
 
+    before = int(u.token_version)
     u.token_version = int(u.token_version) + 1
     db.session.commit()
+
+    write_audit("admin_force_logout", target_user_id=u.id, meta={"before": before, "after": int(u.token_version)})
+
     return jsonify({"ok": True})
+
+
+@app.get("/admin/audit")
+@limiter.limit("60 per minute")
+def admin_audit_all():
+    ok, err = require_admin()
+    if err:
+        return err
+
+    limit = safe_int(request.args.get("limit", 100), 100)
+    limit = max(1, min(limit, 500))
+
+    rows = AuditLog.query.order_by(AuditLog.id.desc()).limit(limit).all()
+    return jsonify({
+        "ok": True,
+        "items": [
+            {
+                "id": a.id,
+                "created_at": dt_iso(a.created_at),
+                "actor_ip": a.actor_ip,
+                "target_user_id": a.target_user_id,
+                "action": a.action,
+                "meta": json.loads(a.meta_json) if a.meta_json else None,
+            }
+            for a in rows
+        ]
+    })
+
+
+@app.get("/admin/user/<int:user_id>/audit")
+@limiter.limit("60 per minute")
+def admin_audit_user(user_id: int):
+    ok, err = require_admin()
+    if err:
+        return err
+
+    limit = safe_int(request.args.get("limit", 100), 100)
+    limit = max(1, min(limit, 500))
+
+    rows = (
+        AuditLog.query
+        .filter(AuditLog.target_user_id == user_id)
+        .order_by(AuditLog.id.desc())
+        .limit(limit)
+        .all()
+    )
+
+    return jsonify({
+        "ok": True,
+        "items": [
+            {
+                "id": a.id,
+                "created_at": dt_iso(a.created_at),
+                "actor_ip": a.actor_ip,
+                "target_user_id": a.target_user_id,
+                "action": a.action,
+                "meta": json.loads(a.meta_json) if a.meta_json else None,
+            }
+            for a in rows
+        ]
+    })
 
 
 # -------------------------
