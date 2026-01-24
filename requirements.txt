@@ -10,4 +10,6 @@ itsdangerous==2.2.0
 stripe==10.12.0
 SQLAlchemy==2.0.31
 Werkzeug==3.0.3
+PyJWT==2.10.1
+
 
