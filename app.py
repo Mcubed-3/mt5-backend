@@ -22,10 +22,11 @@ app = Flask(__name__)
 
 FRONTEND_ORIGINS = ["https://676trades.org", "https://www.676trades.org"]
 
+# IMPORTANT: allow X-API-Key + Content-Type for CORS
 CORS(
     app,
     resources={r"/*": {"origins": FRONTEND_ORIGINS}},
-    allow_headers=["Content-Type", "X-API-Key", "X-Admin-Token", "Stripe-Signature"],
+    allow_headers=["Content-Type", "X-API-Key", "X-Admin-Token"],
     methods=["GET", "POST", "OPTIONS"],
 )
 
@@ -48,16 +49,14 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
 
-
 # -------------------------
 # Stripe config
 # -------------------------
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "").strip()   # must be price_...
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
-APP_BASE_URL = os.getenv("APP_BASE_URL", "https://676trades.org").strip()
+APP_BASE_URL = os.getenv("APP_BASE_URL", "https://676trades.org").strip()  # frontend
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "5"))
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
@@ -78,11 +77,14 @@ class User(db.Model):
 
     enabled = db.Column(db.Boolean, default=False, nullable=False)
 
+    # Backward compatible single symbol
     pair = db.Column(db.String(20), default="XAUUSD", nullable=False)
+    # Multi symbols CSV
     pairs = db.Column(db.String(255), default="XAUUSD", nullable=False)
 
     lot_size = db.Column(db.Float, default=0.01, nullable=False)
 
+    # SL/TP settings
     sl_mode = db.Column(db.String(20), default="dynamic", nullable=False)
     tp_mode = db.Column(db.String(20), default="rr", nullable=False)
 
@@ -96,8 +98,8 @@ class User(db.Model):
     fixed_tp_pips = db.Column(db.Integer, default=50, nullable=False)
 
     # Billing fields
-    plan = db.Column(db.String(20), default="free", nullable=False)
-    subscription_status = db.Column(db.String(30), default="none", nullable=False)
+    plan = db.Column(db.String(20), default="free", nullable=False)  # free / pro
+    subscription_status = db.Column(db.String(30), default="none", nullable=False)  # none/active/past_due/canceled
     trial_ends_at = db.Column(db.DateTime, nullable=True)
 
     stripe_customer_id = db.Column(db.String(80), nullable=True, index=True)
@@ -106,7 +108,7 @@ class User(db.Model):
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     last_login_at = db.Column(db.DateTime, nullable=True)
 
-    # NEW: heartbeat + activity
+    # EA heartbeat fields (already working for you)
     last_seen_at = db.Column(db.DateTime, nullable=True)
     last_seen_symbol = db.Column(db.String(20), nullable=True)
     last_seen_tf = db.Column(db.String(10), nullable=True)
@@ -194,17 +196,6 @@ def require_api_key():
     return user, None
 
 
-def require_admin():
-    if not ADMIN_TOKEN:
-        return None, json_error("Admin not configured on server.", 500)
-    tok = request.headers.get("X-Admin-Token", "").strip()
-    if not tok:
-        return None, json_error("Missing X-Admin-Token header", 401)
-    if tok != ADMIN_TOKEN:
-        return None, json_error("Invalid admin token", 401)
-    return True, None
-
-
 def trial_active(user: User) -> bool:
     if not user.trial_ends_at:
         return False
@@ -230,18 +221,32 @@ def ensure_can_trade(user: User):
     return json_error("Payment required. Please start your free trial / subscribe.", 402)
 
 
-def online_from_last_seen(user: User, minutes: int = 5) -> bool:
+def ea_connected(user: User) -> bool:
     if not user.last_seen_at:
         return False
     now = datetime.now(timezone.utc)
     t = user.last_seen_at
     if t.tzinfo is None:
         t = t.replace(tzinfo=timezone.utc)
-    return now - t <= timedelta(minutes=minutes)
+    return (now - t) <= timedelta(minutes=5)
 
 
 # -------------------------
-# Auto-migration (Postgres safe)
+# Admin auth
+# -------------------------
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+
+def require_admin():
+    token = request.headers.get("X-Admin-Token", "").strip()
+    if not ADMIN_TOKEN:
+        return None, json_error("ADMIN_TOKEN not set on server", 500)
+    if not token or token != ADMIN_TOKEN:
+        return None, json_error("Unauthorized admin request", 401)
+    return True, None
+
+
+# -------------------------
+# Auto-migration (keeps Postgres from breaking)
 # -------------------------
 def ensure_schema():
     uri = app.config["SQLALCHEMY_DATABASE_URI"]
@@ -317,7 +322,7 @@ def ensure_schema():
             add_col('ALTER TABLE "user" ADD COLUMN stripe_subscription_id VARCHAR(80) NULL')
             add_col('CREATE INDEX IF NOT EXISTS ix_user_stripe_subscription_id ON "user"(stripe_subscription_id)')
 
-        # NEW heartbeat/activity columns
+        # heartbeat fields
         if "last_seen_at" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN last_seen_at TIMESTAMPTZ NULL')
         if "last_seen_symbol" not in cols:
@@ -434,32 +439,6 @@ def rotate_key():
 
 
 # -------------------------
-# Routes: EA Heartbeat
-# -------------------------
-@app.post("/api/v1/heartbeat")
-@limiter.limit("120 per minute")
-def heartbeat():
-    user, err = require_api_key()
-    if err:
-        return err
-
-    data = request.get_json(silent=True) or {}
-    symbol = (data.get("symbol") or "").strip().upper()[:20] or None
-    tf = (data.get("tf") or "").strip().upper()[:10] or None
-
-    # IP best-effort (Render usually sets X-Forwarded-For)
-    ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "").split(",")[0].strip()[:64]
-
-    user.last_seen_at = datetime.now(timezone.utc)
-    user.last_seen_symbol = symbol
-    user.last_seen_tf = tf
-    user.last_seen_ip = ip
-    db.session.commit()
-
-    return jsonify({"ok": True})
-
-
-# -------------------------
 # Routes: Control (EA + Dashboard)
 # -------------------------
 @app.get("/api/v1/status")
@@ -489,16 +468,16 @@ def status():
         "fixed_sl_pips": int(user.fixed_sl_pips),
         "fixed_tp_pips": int(user.fixed_tp_pips),
 
-        # heartbeat snapshot
-        "online": online_from_last_seen(user, minutes=5),
-        "last_seen_at": user.last_seen_at.isoformat() if user.last_seen_at else None,
-        "last_seen_symbol": user.last_seen_symbol,
-        "last_seen_tf": user.last_seen_tf,
-
         # billing snapshot
         "plan": user.plan,
         "subscription_status": user.subscription_status,
         "trial_ends_at": user.trial_ends_at.isoformat() if user.trial_ends_at else None,
+
+        # heartbeat snapshot
+        "ea_connected": ea_connected(user),
+        "last_seen_at": user.last_seen_at.isoformat() if user.last_seen_at else None,
+        "last_seen_symbol": user.last_seen_symbol,
+        "last_seen_tf": user.last_seen_tf,
     })
 
 
@@ -538,6 +517,7 @@ def settings():
 
     data = request.get_json(silent=True) or {}
 
+    # accept "pairs" OR "pair"
     if "pairs" in data:
         try:
             user.pairs = normalize_pairs(str(data["pairs"]))
@@ -610,12 +590,36 @@ def settings():
         user.fixed_tp_pips = v
 
     user.last_settings_at = datetime.now(timezone.utc)
+
     db.session.commit()
     return status()
 
 
 # -------------------------
-# Billing routes
+# EA Heartbeat
+# -------------------------
+@app.post("/api/v1/heartbeat")
+@limiter.limit("240 per minute")
+def heartbeat():
+    user, err = require_api_key()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    symbol = (data.get("symbol") or "").strip().upper() or None
+    tf = (data.get("tf") or "").strip().upper() or None
+
+    user.last_seen_at = datetime.now(timezone.utc)
+    user.last_seen_symbol = symbol
+    user.last_seen_tf = tf
+    user.last_seen_ip = request.headers.get("CF-Connecting-IP") or request.remote_addr
+
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+# -------------------------
+# Billing routes (frontend uses X-API-Key)
 # -------------------------
 @app.get("/billing/status")
 @limiter.limit("60 per minute")
@@ -690,6 +694,9 @@ def create_portal_session():
     return jsonify({"ok": True, "url": portal.url})
 
 
+# -------------------------
+# Stripe webhook
+# -------------------------
 @app.post("/stripe/webhook")
 def stripe_webhook():
     if not STRIPE_WEBHOOK_SECRET:
@@ -831,35 +838,33 @@ def admin_users():
         return err
 
     q = (request.args.get("q") or "").strip().lower()
-    limit = safe_int(request.args.get("limit", 200), 200)
-    limit = max(1, min(limit, 500))
 
     query = User.query
     if q:
         query = query.filter(User.email.ilike(f"%{q}%"))
 
-    users = query.order_by(User.id.desc()).limit(limit).all()
+    users = query.order_by(User.id.desc()).limit(200).all()
 
-    items = []
-    for u in users:
-        items.append({
-            "id": u.id,
-            "email": u.email,
-            "plan": u.plan,
-            "subscription_status": u.subscription_status,
-            "enabled": bool(u.enabled),
-            "pairs": u.pairs,
-            "lot_size": float(u.lot_size),
-            "online": online_from_last_seen(u, minutes=5),
-            "last_seen_at": u.last_seen_at.isoformat() if u.last_seen_at else None,
-        })
-
-    return jsonify({"ok": True, "items": items})
+    return jsonify({
+        "ok": True,
+        "items": [
+            {
+                "id": u.id,
+                "email": u.email,
+                "plan": u.plan,
+                "subscription_status": u.subscription_status,
+                "pairs": u.pairs,
+                "online": ea_connected(u),
+                "last_seen_at": u.last_seen_at.isoformat() if u.last_seen_at else None,
+            }
+            for u in users
+        ]
+    })
 
 
 @app.get("/admin/user/<int:user_id>/activity")
 @limiter.limit("60 per minute")
-def admin_user_activity(user_id: int):
+def admin_user_activity(user_id):
     ok, err = require_admin()
     if err:
         return err
@@ -885,12 +890,10 @@ def admin_user_activity(user_id: int):
             "subscription_status": u.subscription_status,
             "enabled": bool(u.enabled),
             "pairs": u.pairs,
-            "lot_size": float(u.lot_size),
-
+            "lot_size": u.lot_size,
             "created_at": u.created_at.isoformat() if u.created_at else None,
             "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None,
             "last_settings_at": u.last_settings_at.isoformat() if u.last_settings_at else None,
-
             "last_seen_at": u.last_seen_at.isoformat() if u.last_seen_at else None,
             "last_seen_symbol": u.last_seen_symbol,
             "last_seen_tf": u.last_seen_tf,
@@ -905,13 +908,52 @@ def admin_user_activity(user_id: int):
                 "entry": t.entry,
                 "sl": t.sl,
                 "tp": t.tp,
-                "deal_id": t.deal_id,
                 "profit": t.profit,
-                "opened_at": t.opened_at.isoformat(),
+                "opened_at": t.opened_at.isoformat() if t.opened_at else None,
             }
             for t in trades
         ]
     })
+
+
+@app.post("/admin/user/<int:user_id>/disable")
+@limiter.limit("60 per minute")
+def admin_disable_user(user_id):
+    ok, err = require_admin()
+    if err:
+        return err
+
+    user = User.query.get(user_id)
+    if not user:
+        return json_error("User not found", 404)
+
+    user.enabled = False
+    db.session.commit()
+    return jsonify({"ok": True, "id": user.id, "enabled": False})
+
+
+@app.post("/admin/user/<int:user_id>/enable")
+@limiter.limit("60 per minute")
+def admin_enable_user(user_id):
+    ok, err = require_admin()
+    if err:
+        return err
+
+    user = User.query.get(user_id)
+    if not user:
+        return json_error("User not found", 404)
+
+    data = request.get_json(silent=True) or {}
+    force = bool(data.get("force", False))
+
+    if not force:
+        pay_err = ensure_can_trade(user)
+        if pay_err:
+            return pay_err
+
+    user.enabled = True
+    db.session.commit()
+    return jsonify({"ok": True, "id": user.id, "enabled": True, "forced": force})
 
 
 # -------------------------
