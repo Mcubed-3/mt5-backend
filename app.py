@@ -64,7 +64,7 @@ if STRIPE_SECRET_KEY:
 # Admin config
 # -------------------------
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
-HEARTBEAT_ONLINE_SECONDS = int(os.getenv("HEARTBEAT_ONLINE_SECONDS", "300"))  # 5 mins default
+HEARTBEAT_ONLINE_SECONDS = int(os.getenv("HEARTBEAT_ONLINE_SECONDS", "300"))  # 5 mins
 
 
 # -------------------------
@@ -140,6 +140,21 @@ class Trade(db.Model):
     profit = db.Column(db.Float, nullable=True)
 
     opened_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+class ErrorLog(db.Model):
+    __tablename__ = "error_log"
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), index=True, nullable=True)
+    user = db.relationship("User", backref="errors")
+
+    source = db.Column(db.String(30), default="unknown", nullable=False)  # ea/frontend/backend
+    message = db.Column(db.String(800), nullable=False)
+    context = db.Column(db.String(1200), nullable=True)
+
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 
 # -------------------------
@@ -247,6 +262,20 @@ def ensure_can_trade(user: User):
     return json_error("Payment required. Please start your free trial / subscribe.", 402)
 
 
+def log_error(user_id, source, message, context=None):
+    try:
+        e = ErrorLog(
+            user_id=user_id,
+            source=(source or "unknown")[:30],
+            message=(message or "")[:800] or "unknown error",
+            context=(context or "")[:1200] or None,
+        )
+        db.session.add(e)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+
 # -------------------------
 # Auto-migration (Postgres safe)
 # -------------------------
@@ -336,7 +365,7 @@ def ensure_schema():
         if "last_settings_at" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN last_settings_at TIMESTAMPTZ NULL')
 
-        # trade table
+        # trades
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS trade (
                 id SERIAL PRIMARY KEY,
@@ -354,6 +383,20 @@ def ensure_schema():
         """))
         conn.execute(text('CREATE INDEX IF NOT EXISTS ix_trade_user_id ON trade(user_id)'))
         conn.execute(text('CREATE INDEX IF NOT EXISTS ix_trade_deal_id ON trade(deal_id)'))
+
+        # errors
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS error_log (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NULL REFERENCES "user"(id),
+                source VARCHAR(30) NOT NULL DEFAULT 'unknown',
+                message VARCHAR(800) NOT NULL,
+                context VARCHAR(1200) NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
+        conn.execute(text('CREATE INDEX IF NOT EXISTS ix_error_log_user_id ON error_log(user_id)'))
+        conn.execute(text('CREATE INDEX IF NOT EXISTS ix_error_log_created_at ON error_log(created_at)'))
 
 
 # -------------------------
@@ -439,6 +482,28 @@ def rotate_key():
     db.session.commit()
 
     return jsonify({"ok": True, "api_key": user.api_key})
+
+
+# -------------------------
+# Error logging (EA / frontend can call this)
+# -------------------------
+@app.post("/api/v1/log-error")
+@limiter.limit("120 per minute")
+def api_log_error():
+    user, err = require_api_key()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    source = (data.get("source") or "ea").strip().lower()
+    message = (data.get("message") or "").strip()
+    context = (data.get("context") or "").strip()
+
+    if not message:
+        return json_error("message is required", 400)
+
+    log_error(user.id, source, message, context)
+    return jsonify({"ok": True})
 
 
 # -------------------------
@@ -962,16 +1027,9 @@ def admin_rotate_user_key(user_id):
     u.enabled = False
     db.session.commit()
 
-    return jsonify({
-        "ok": True,
-        "id": u.id,
-        "email": u.email,
-        "enabled": bool(u.enabled),
-        "api_key": u.api_key
-    })
+    return jsonify({"ok": True, "id": u.id, "email": u.email, "enabled": bool(u.enabled), "api_key": u.api_key})
 
 
-# ✅ NEW: Admin billing override
 @app.post("/admin/user/<int:user_id>/set-billing")
 @limiter.limit("60 per minute")
 def admin_set_billing(user_id):
@@ -985,7 +1043,6 @@ def admin_set_billing(user_id):
 
     data = request.get_json(silent=True) or {}
 
-    # allow keys: plan, subscription_status, trial_days, trial_until, disable_if_unpaid
     plan = (data.get("plan") or "").strip().lower()
     sub = (data.get("subscription_status") or "").strip().lower()
 
@@ -999,7 +1056,6 @@ def admin_set_billing(user_id):
             return json_error("subscription_status must be none/active/past_due/canceled", 400)
         u.subscription_status = sub
 
-    # trial_days: extend from now
     if "trial_days" in data and data["trial_days"] is not None:
         td = safe_int(data.get("trial_days"))
         if td is None or td < 0 or td > 365:
@@ -1009,10 +1065,8 @@ def admin_set_billing(user_id):
         else:
             u.trial_ends_at = datetime.now(timezone.utc) + timedelta(days=td)
 
-    # trial_until: ISO string
     if "trial_until" in data and data["trial_until"]:
         try:
-            # accept '2026-01-24T12:00:00Z' or without Z
             s = str(data["trial_until"]).strip()
             if s.endswith("Z"):
                 s = s[:-1] + "+00:00"
@@ -1021,9 +1075,8 @@ def admin_set_billing(user_id):
                 dt = dt.replace(tzinfo=timezone.utc)
             u.trial_ends_at = dt
         except Exception:
-            return json_error("trial_until must be ISO date-time (e.g. 2026-01-24T12:00:00Z)", 400)
+            return json_error("trial_until must be ISO date-time (e.g. 2026-02-01T00:00:00Z)", 400)
 
-    # optional: auto-disable EA if override makes them unpaid
     disable_if_unpaid = bool(data.get("disable_if_unpaid", True))
     if disable_if_unpaid:
         if not (u.subscription_status == "active" or trial_active(u)):
@@ -1039,6 +1092,98 @@ def admin_set_billing(user_id):
         "subscription_status": u.subscription_status,
         "trial_ends_at": u.trial_ends_at.isoformat() if u.trial_ends_at else None,
         "enabled": bool(u.enabled)
+    })
+
+
+# ✅ NEW: Clear a user's trades
+@app.post("/admin/user/<int:user_id>/clear-trades")
+@limiter.limit("60 per minute")
+def admin_clear_trades(user_id):
+    ok, err = require_admin()
+    if err:
+        return err
+
+    u = User.query.get(user_id)
+    if not u:
+        return json_error("User not found", 404)
+
+    deleted = Trade.query.filter_by(user_id=u.id).delete()
+    db.session.commit()
+    return jsonify({"ok": True, "id": u.id, "deleted": int(deleted)})
+
+
+# ✅ NEW: Reset user password (returns temp password)
+@app.post("/admin/user/<int:user_id>/reset-password")
+@limiter.limit("60 per minute")
+def admin_reset_password(user_id):
+    ok, err = require_admin()
+    if err:
+        return err
+
+    u = User.query.get(user_id)
+    if not u:
+        return json_error("User not found", 404)
+
+    data = request.get_json(silent=True) or {}
+    new_password = (data.get("new_password") or "").strip()
+
+    if not new_password:
+        # generate a temp password
+        new_password = secrets.token_urlsafe(9)  # ~12 chars
+
+    if len(new_password) < 8:
+        return json_error("Password must be at least 8 characters", 400)
+
+    u.password_hash = generate_password_hash(new_password)
+    u.enabled = False  # safety: disable EA until user confirms access
+    db.session.commit()
+
+    return jsonify({"ok": True, "id": u.id, "email": u.email, "temp_password": new_password, "enabled": bool(u.enabled)})
+
+
+# ✅ NEW: Admin errors viewer
+@app.get("/admin/errors")
+@limiter.limit("60 per minute")
+def admin_errors():
+    ok, err = require_admin()
+    if err:
+        return err
+
+    limit = safe_int(request.args.get("limit", 100), 100)
+    limit = max(1, min(limit, 300))
+
+    user_id = request.args.get("user_id", None)
+    q = (request.args.get("q") or "").strip().lower()
+
+    qry = ErrorLog.query
+
+    if user_id:
+        try:
+            uid = int(user_id)
+            qry = qry.filter(ErrorLog.user_id == uid)
+        except Exception:
+            return json_error("user_id must be an integer", 400)
+
+    if q:
+        qry = qry.filter(
+            (ErrorLog.message.ilike(f"%{q}%")) | (ErrorLog.context.ilike(f"%{q}%"))
+        )
+
+    rows = qry.order_by(ErrorLog.id.desc()).limit(limit).all()
+
+    return jsonify({
+        "ok": True,
+        "items": [
+            {
+                "id": r.id,
+                "user_id": r.user_id,
+                "source": r.source,
+                "message": r.message,
+                "context": r.context,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ]
     })
 
 
