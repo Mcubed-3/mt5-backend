@@ -4,6 +4,8 @@ import base64
 import hmac
 import hashlib
 import json
+import smtplib
+from email.message import EmailMessage
 from datetime import datetime, timezone, timedelta
 
 from flask import Flask, request, jsonify
@@ -79,6 +81,25 @@ TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "5"))
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
+# -------------------------
+# Email (password reset) config (optional)
+# -------------------------
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "").strip()
+SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
+SMTP_FROM = os.getenv("SMTP_FROM", "support@676trades.org").strip()
+SUPPORT_EMAIL = os.getenv("SUPPORT_EMAIL", "support@676trades.org").strip()
+
+# -------------------------
+# Supported markets policy
+# -------------------------
+# Public supported markets (beginner-friendly launch set)
+PUBLIC_ALLOWED_PAIRS = {"XAUUSD", "EURUSD", "GBPUSD", "USDJPY"}
+
+# Locked for now (admin testing only)
+ADMIN_TEST_ONLY_PAIRS = {"BTCUSD", "NAS100", "US30"}
+
 
 # -------------------------
 # Models
@@ -91,7 +112,7 @@ class User(db.Model):
     email = db.Column(db.String(255), unique=True, nullable=False, index=True)
     password_hash = db.Column(db.String(255), nullable=False)
 
-    # EA auth (unchanged)
+    # EA auth
     api_key = db.Column(db.String(64), unique=True, nullable=False, index=True)
 
     enabled = db.Column(db.Boolean, default=False, nullable=False)
@@ -168,24 +189,6 @@ class Trade(db.Model):
     opened_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 
-class AuditLog(db.Model):
-    __tablename__ = "audit_log"
-
-    id = db.Column(db.Integer, primary_key=True)
-
-    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-
-    # who performed the action (admin)
-    actor_ip = db.Column(db.String(64), nullable=True)
-
-    # which user was targeted
-    target_user_id = db.Column(db.Integer, nullable=True, index=True)
-
-    # what happened
-    action = db.Column(db.String(64), nullable=False)
-    meta_json = db.Column(db.Text, nullable=True)
-
-
 # -------------------------
 # Helpers
 # -------------------------
@@ -207,20 +210,30 @@ def safe_int(v, default=None):
         return default
 
 
-def normalize_pairs(value: str) -> str:
+def normalize_pairs(value: str, allowed_set=None) -> str:
     parts = [p.strip().upper() for p in (value or "").split(",")]
     parts = [p for p in parts if p]
+
+    if not parts:
+        raise ValueError("pairs cannot be empty")
+
     for p in parts:
         if len(p) < 3 or len(p) > 12:
             raise ValueError("pair looks invalid")
+
+    if allowed_set is not None:
+        for p in parts:
+            if p not in allowed_set:
+                supported = ", ".join(sorted(allowed_set))
+                raise ValueError(f"{p} is not supported yet. Supported: {supported}")
+
     seen = set()
     out = []
     for p in parts:
         if p not in seen:
             seen.add(p)
             out.append(p)
-    if not out:
-        raise ValueError("pairs cannot be empty")
+
     return ",".join(out)
 
 
@@ -240,30 +253,13 @@ def dt_iso(dt):
 
 
 def client_ip():
-    # If you put Cloudflare in front, this header is set:
     cf = request.headers.get("CF-Connecting-IP", "").strip()
     if cf:
         return cf
-    # Render / proxies may set X-Forwarded-For:
     xff = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
     if xff:
         return xff
     return request.remote_addr or ""
-
-
-def write_audit(action: str, target_user_id=None, meta: dict = None):
-    try:
-        a = AuditLog(
-            actor_ip=(client_ip() or "")[:64],
-            target_user_id=target_user_id,
-            action=action[:64],
-            meta_json=json.dumps(meta or {}, separators=(",", ":")) if meta else None,
-        )
-        db.session.add(a)
-        db.session.commit()
-    except Exception:
-        # never block critical admin actions because audit write failed
-        db.session.rollback()
 
 
 # -------------------------
@@ -403,6 +399,31 @@ def require_admin():
 
 
 # -------------------------
+# Email helper (optional)
+# -------------------------
+def send_email(to_email: str, subject: str, body: str) -> bool:
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+        # Not configured -> return False (but routes will still return generic OK)
+        return False
+
+    try:
+        msg = EmailMessage()
+        msg["From"] = SMTP_FROM
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.set_content(body)
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.send_message(msg)
+        return True
+    except Exception as e:
+        print("Email send failed:", str(e))
+        return False
+
+
+# -------------------------
 # Auto-migration (Postgres safe)
 # -------------------------
 def ensure_schema():
@@ -520,19 +541,6 @@ def ensure_schema():
         conn.execute(text('CREATE INDEX IF NOT EXISTS ix_trade_user_id ON trade(user_id)'))
         conn.execute(text('CREATE INDEX IF NOT EXISTS ix_trade_deal_id ON trade(deal_id)'))
 
-        # audit table
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id SERIAL PRIMARY KEY,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                actor_ip VARCHAR(64) NULL,
-                target_user_id INTEGER NULL,
-                action VARCHAR(64) NOT NULL,
-                meta_json TEXT NULL
-            )
-        """))
-        conn.execute(text('CREATE INDEX IF NOT EXISTS ix_audit_target_user_id ON audit_log(target_user_id)'))
-
 
 # -------------------------
 # Preflight helper (OPTIONS)
@@ -547,7 +555,7 @@ def any_options(_any):
 # -------------------------
 @app.get("/")
 def root():
-    return jsonify({"ok": True, "service": "mt5-control-backend", "version": "v2-jwt-admin-audit"})
+    return jsonify({"ok": True, "service": "mt5-control-backend", "version": "v2-jwt-admin-pairlock"})
 
 
 @app.get("/health")
@@ -636,7 +644,73 @@ def rotate_key_user():
 
 
 # -------------------------
+# Password reset (email optional)
+# -------------------------
+@app.post("/auth/forgot-password")
+@limiter.limit("20 per hour")
+def forgot_password():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+
+    # Always return OK (avoid account enumeration)
+    if not email:
+        return jsonify({"ok": True})
+
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        return jsonify({"ok": True})
+
+    raw = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw.encode()).hexdigest()
+    user.reset_token_hash = token_hash
+    user.reset_token_expires_at = now_utc() + timedelta(minutes=30)
+    db.session.commit()
+
+    reset_link = f"{APP_BASE_URL}/reset.html?token={raw}"
+    body = (
+        "You requested a password reset for 676Trades.\n\n"
+        f"Reset link (valid ~30 minutes):\n{reset_link}\n\n"
+        "If you did not request this, you can ignore this email.\n"
+        f"Support: {SUPPORT_EMAIL}\n"
+    )
+
+    send_email(email, "676Trades - Password reset", body)
+    return jsonify({"ok": True})
+
+
+@app.post("/auth/reset-password")
+@limiter.limit("20 per hour")
+def reset_password():
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or "").strip()
+    new_password = (data.get("password") or "").strip()
+
+    if not token or not new_password:
+        return json_error("token and password required", 400)
+
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    user = User.query.filter_by(reset_token_hash=token_hash).first()
+    if not user or not user.reset_token_expires_at:
+        return json_error("Invalid or expired token", 400)
+
+    exp = user.reset_token_expires_at
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if now_utc() > exp:
+        return json_error("Invalid or expired token", 400)
+
+    user.password_hash = generate_password_hash(new_password)
+    user.reset_token_hash = None
+    user.reset_token_expires_at = None
+    user.token_version = int(user.token_version) + 1  # force logout all sessions
+    db.session.commit()
+
+    return jsonify({"ok": True})
+
+
+# -------------------------
 # Routes: Control (EA + Dashboard)
+# Dashboard uses JWT; EA uses X-API-Key
 # -------------------------
 @app.get("/api/v1/status")
 @limiter.limit("120 per minute")
@@ -646,7 +720,7 @@ def status():
     if err:
         user, err2 = require_jwt()
         if err2:
-            return err
+            return err  # keep original error message for EA callers
 
     pairs_csv = (user.pairs or user.pair or "XAUUSD").strip() or "XAUUSD"
     online = ea_connected(user, minutes=5)
@@ -668,13 +742,16 @@ def status():
         "fixed_sl_pips": int(user.fixed_sl_pips),
         "fixed_tp_pips": int(user.fixed_tp_pips),
 
+        # billing snapshot
         "plan": user.plan,
         "subscription_status": user.subscription_status,
         "trial_ends_at": dt_iso(user.trial_ends_at),
 
+        # heartbeat snapshot
         "ea_connected": bool(online),
         "last_seen_at": dt_iso(user.last_seen_at),
 
+        # optional risk ack
         "risk_ack_at": dt_iso(user.risk_ack_at),
     })
 
@@ -715,16 +792,17 @@ def settings():
 
     data = request.get_json(silent=True) or {}
 
+    # Enforce public supported markets only
     if "pairs" in data:
         try:
-            user.pairs = normalize_pairs(str(data["pairs"]))
+            user.pairs = normalize_pairs(str(data["pairs"]), allowed_set=PUBLIC_ALLOWED_PAIRS)
             user.pair = first_pair(user.pairs)
         except ValueError as e:
             return json_error(str(e), 400)
 
     if "pair" in data and "pairs" not in data:
         try:
-            single = normalize_pairs(str(data["pair"]))
+            single = normalize_pairs(str(data["pair"]), allowed_set=PUBLIC_ALLOWED_PAIRS)
             user.pairs = single
             user.pair = first_pair(single)
         except ValueError as e:
@@ -808,7 +886,7 @@ def heartbeat():
     user.last_seen_at = now_utc()
     user.last_seen_symbol = (data.get("symbol") or "").strip().upper()[:20] or user.last_seen_symbol
     user.last_seen_tf = (data.get("tf") or "").strip().upper()[:10] or user.last_seen_tf
-    user.last_seen_ip = (client_ip() or "")[:64] or user.last_seen_ip
+    user.last_seen_ip = client_ip()[:64] or user.last_seen_ip
     db.session.commit()
     return jsonify({"ok": True})
 
@@ -951,7 +1029,7 @@ def stripe_webhook():
 
 
 # -------------------------
-# Trades routes
+# Trades routes (EA can post with X-API-Key; website can read with JWT)
 # -------------------------
 @app.post("/api/v1/trades")
 @limiter.limit("120 per minute")
@@ -1112,7 +1190,6 @@ def admin_user_activity(user_id: int):
     })
 
 
-# Backwards compatible route name
 @app.post("/admin/user/<int:user_id>/force-enabled")
 def admin_force_enabled(user_id: int):
     ok, err = require_admin()
@@ -1126,23 +1203,9 @@ def admin_force_enabled(user_id: int):
     if not u:
         return json_error("User not found", 404)
 
-    before = bool(u.enabled)
     u.enabled = enabled
     db.session.commit()
-
-    write_audit(
-        "admin_force_toggle",
-        target_user_id=u.id,
-        meta={"before": before, "after": bool(u.enabled)},
-    )
-
     return jsonify({"ok": True, "enabled": bool(u.enabled)})
-
-
-# Preferred alias route (clean naming)
-@app.post("/admin/user/<int:user_id>/force-toggle")
-def admin_force_toggle(user_id: int):
-    return admin_force_enabled(user_id)
 
 
 @app.post("/admin/user/<int:user_id>/rotate-api-key")
@@ -1155,12 +1218,8 @@ def admin_rotate_api_key(user_id: int):
     if not u:
         return json_error("User not found", 404)
 
-    before = u.api_key
     u.api_key = secrets.token_hex(24)
     db.session.commit()
-
-    write_audit("admin_rotate_api_key", target_user_id=u.id, meta={"before_last6": before[-6:], "after_last6": u.api_key[-6:]})
-
     return jsonify({"ok": True, "api_key": u.api_key})
 
 
@@ -1183,8 +1242,6 @@ def admin_override_billing(user_id: int):
     if sub and sub not in ("none", "active", "past_due", "canceled"):
         return json_error("subscription_status invalid", 400)
 
-    before = {"plan": u.plan, "subscription_status": u.subscription_status, "enabled": bool(u.enabled)}
-
     if plan:
         u.plan = plan
     if sub:
@@ -1194,10 +1251,6 @@ def admin_override_billing(user_id: int):
         u.enabled = False
 
     db.session.commit()
-
-    after = {"plan": u.plan, "subscription_status": u.subscription_status, "enabled": bool(u.enabled)}
-    write_audit("admin_override_billing", target_user_id=u.id, meta={"before": before, "after": after})
-
     return jsonify({"ok": True})
 
 
@@ -1212,11 +1265,13 @@ def admin_override_settings(user_id: int):
         return json_error("User not found", 404)
 
     data = request.get_json(silent=True) or {}
-    before = {"pairs": u.pairs, "lot_size": float(u.lot_size)}
+
+    # Admin can set public + test-only pairs
+    admin_allowed = PUBLIC_ALLOWED_PAIRS | ADMIN_TEST_ONLY_PAIRS
 
     if "pairs" in data:
         try:
-            u.pairs = normalize_pairs(str(data["pairs"]))
+            u.pairs = normalize_pairs(str(data["pairs"]), allowed_set=admin_allowed)
             u.pair = first_pair(u.pairs)
         except ValueError as e:
             return json_error(str(e), 400)
@@ -1229,10 +1284,6 @@ def admin_override_settings(user_id: int):
 
     u.last_settings_at = now_utc()
     db.session.commit()
-
-    after = {"pairs": u.pairs, "lot_size": float(u.lot_size)}
-    write_audit("admin_override_settings", target_user_id=u.id, meta={"before": before, "after": after})
-
     return jsonify({"ok": True})
 
 
@@ -1246,74 +1297,9 @@ def admin_force_logout(user_id: int):
     if not u:
         return json_error("User not found", 404)
 
-    before = int(u.token_version)
     u.token_version = int(u.token_version) + 1
     db.session.commit()
-
-    write_audit("admin_force_logout", target_user_id=u.id, meta={"before": before, "after": int(u.token_version)})
-
     return jsonify({"ok": True})
-
-
-@app.get("/admin/audit")
-@limiter.limit("60 per minute")
-def admin_audit_all():
-    ok, err = require_admin()
-    if err:
-        return err
-
-    limit = safe_int(request.args.get("limit", 100), 100)
-    limit = max(1, min(limit, 500))
-
-    rows = AuditLog.query.order_by(AuditLog.id.desc()).limit(limit).all()
-    return jsonify({
-        "ok": True,
-        "items": [
-            {
-                "id": a.id,
-                "created_at": dt_iso(a.created_at),
-                "actor_ip": a.actor_ip,
-                "target_user_id": a.target_user_id,
-                "action": a.action,
-                "meta": json.loads(a.meta_json) if a.meta_json else None,
-            }
-            for a in rows
-        ]
-    })
-
-
-@app.get("/admin/user/<int:user_id>/audit")
-@limiter.limit("60 per minute")
-def admin_audit_user(user_id: int):
-    ok, err = require_admin()
-    if err:
-        return err
-
-    limit = safe_int(request.args.get("limit", 100), 100)
-    limit = max(1, min(limit, 500))
-
-    rows = (
-        AuditLog.query
-        .filter(AuditLog.target_user_id == user_id)
-        .order_by(AuditLog.id.desc())
-        .limit(limit)
-        .all()
-    )
-
-    return jsonify({
-        "ok": True,
-        "items": [
-            {
-                "id": a.id,
-                "created_at": dt_iso(a.created_at),
-                "actor_ip": a.actor_ip,
-                "target_user_id": a.target_user_id,
-                "action": a.action,
-                "meta": json.loads(a.meta_json) if a.meta_json else None,
-            }
-            for a in rows
-        ]
-    })
 
 
 # -------------------------
