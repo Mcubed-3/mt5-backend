@@ -22,7 +22,6 @@ app = Flask(__name__)
 
 FRONTEND_ORIGINS = ["https://676trades.org", "https://www.676trades.org"]
 
-# IMPORTANT: allow X-API-Key + Content-Type for CORS
 CORS(
     app,
     resources={r"/*": {"origins": FRONTEND_ORIGINS}},
@@ -53,13 +52,19 @@ db = SQLAlchemy(app)
 # Stripe config
 # -------------------------
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
-STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "").strip()   # must be price_...
+STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "").strip()  # price_...
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
-APP_BASE_URL = os.getenv("APP_BASE_URL", "https://676trades.org").strip()  # frontend
+APP_BASE_URL = os.getenv("APP_BASE_URL", "https://676trades.org").strip()
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "5"))
 
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
+
+# -------------------------
+# Admin config
+# -------------------------
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+HEARTBEAT_ONLINE_SECONDS = int(os.getenv("HEARTBEAT_ONLINE_SECONDS", "300"))  # 5 mins default
 
 
 # -------------------------
@@ -97,7 +102,7 @@ class User(db.Model):
     fixed_sl_pips = db.Column(db.Integer, default=50, nullable=False)
     fixed_tp_pips = db.Column(db.Integer, default=50, nullable=False)
 
-    # Billing fields
+    # Billing
     plan = db.Column(db.String(20), default="free", nullable=False)  # free / pro
     subscription_status = db.Column(db.String(30), default="none", nullable=False)  # none/active/past_due/canceled
     trial_ends_at = db.Column(db.DateTime, nullable=True)
@@ -108,12 +113,13 @@ class User(db.Model):
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     last_login_at = db.Column(db.DateTime, nullable=True)
 
-    # EA heartbeat fields (already working for you)
+    # EA Heartbeat
     last_seen_at = db.Column(db.DateTime, nullable=True)
     last_seen_symbol = db.Column(db.String(20), nullable=True)
     last_seen_tf = db.Column(db.String(10), nullable=True)
     last_seen_ip = db.Column(db.String(64), nullable=True)
 
+    # Activity tracking
     last_settings_at = db.Column(db.DateTime, nullable=True)
 
 
@@ -196,13 +202,36 @@ def require_api_key():
     return user, None
 
 
+def require_admin():
+    if not ADMIN_TOKEN:
+        return None, json_error("Admin not configured on server.", 500)
+    token = request.headers.get("X-Admin-Token", "").strip()
+    if not token or token != ADMIN_TOKEN:
+        return None, json_error("Invalid admin token", 401)
+    return True, None
+
+
+def _as_utc(dt):
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def is_online(user: User) -> bool:
+    if not user.last_seen_at:
+        return False
+    now = datetime.now(timezone.utc)
+    last = _as_utc(user.last_seen_at)
+    return (now - last).total_seconds() <= HEARTBEAT_ONLINE_SECONDS
+
+
 def trial_active(user: User) -> bool:
     if not user.trial_ends_at:
         return False
     now = datetime.now(timezone.utc)
-    t = user.trial_ends_at
-    if t.tzinfo is None:
-        t = t.replace(tzinfo=timezone.utc)
+    t = _as_utc(user.trial_ends_at)
     return now < t
 
 
@@ -221,32 +250,8 @@ def ensure_can_trade(user: User):
     return json_error("Payment required. Please start your free trial / subscribe.", 402)
 
 
-def ea_connected(user: User) -> bool:
-    if not user.last_seen_at:
-        return False
-    now = datetime.now(timezone.utc)
-    t = user.last_seen_at
-    if t.tzinfo is None:
-        t = t.replace(tzinfo=timezone.utc)
-    return (now - t) <= timedelta(minutes=5)
-
-
 # -------------------------
-# Admin auth
-# -------------------------
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
-
-def require_admin():
-    token = request.headers.get("X-Admin-Token", "").strip()
-    if not ADMIN_TOKEN:
-        return None, json_error("ADMIN_TOKEN not set on server", 500)
-    if not token or token != ADMIN_TOKEN:
-        return None, json_error("Unauthorized admin request", 401)
-    return True, None
-
-
-# -------------------------
-# Auto-migration (keeps Postgres from breaking)
+# Auto-migration (Postgres safe)
 # -------------------------
 def ensure_schema():
     uri = app.config["SQLALCHEMY_DATABASE_URI"]
@@ -322,7 +327,7 @@ def ensure_schema():
             add_col('ALTER TABLE "user" ADD COLUMN stripe_subscription_id VARCHAR(80) NULL')
             add_col('CREATE INDEX IF NOT EXISTS ix_user_stripe_subscription_id ON "user"(stripe_subscription_id)')
 
-        # heartbeat fields
+        # heartbeat + activity
         if "last_seen_at" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN last_seen_at TIMESTAMPTZ NULL')
         if "last_seen_symbol" not in cols:
@@ -368,7 +373,7 @@ def health():
 
 
 # -------------------------
-# Routes: Auth
+# Auth
 # -------------------------
 @app.post("/auth/register")
 @limiter.limit("10 per hour")
@@ -433,13 +438,34 @@ def rotate_key():
         return json_error("Invalid email or password", 401)
 
     user.api_key = secrets.token_hex(24)
+    user.enabled = False
     db.session.commit()
 
     return jsonify({"ok": True, "api_key": user.api_key})
 
 
 # -------------------------
-# Routes: Control (EA + Dashboard)
+# EA Heartbeat (EA calls this)
+# -------------------------
+@app.post("/api/v1/heartbeat")
+@limiter.limit("120 per minute")
+def heartbeat():
+    user, err = require_api_key()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    user.last_seen_at = datetime.now(timezone.utc)
+    user.last_seen_symbol = (data.get("symbol") or "").strip().upper() or user.last_seen_symbol
+    user.last_seen_tf = (data.get("tf") or "").strip().upper() or user.last_seen_tf
+    user.last_seen_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+# -------------------------
+# Control (EA + Dashboard)
 # -------------------------
 @app.get("/api/v1/status")
 @limiter.limit("120 per minute")
@@ -468,13 +494,12 @@ def status():
         "fixed_sl_pips": int(user.fixed_sl_pips),
         "fixed_tp_pips": int(user.fixed_tp_pips),
 
-        # billing snapshot
         "plan": user.plan,
         "subscription_status": user.subscription_status,
         "trial_ends_at": user.trial_ends_at.isoformat() if user.trial_ends_at else None,
 
-        # heartbeat snapshot
-        "ea_connected": ea_connected(user),
+        # Heartbeat for dashboard indicator
+        "ea_connected": is_online(user),
         "last_seen_at": user.last_seen_at.isoformat() if user.last_seen_at else None,
         "last_seen_symbol": user.last_seen_symbol,
         "last_seen_tf": user.last_seen_tf,
@@ -590,36 +615,12 @@ def settings():
         user.fixed_tp_pips = v
 
     user.last_settings_at = datetime.now(timezone.utc)
-
     db.session.commit()
     return status()
 
 
 # -------------------------
-# EA Heartbeat
-# -------------------------
-@app.post("/api/v1/heartbeat")
-@limiter.limit("240 per minute")
-def heartbeat():
-    user, err = require_api_key()
-    if err:
-        return err
-
-    data = request.get_json(silent=True) or {}
-    symbol = (data.get("symbol") or "").strip().upper() or None
-    tf = (data.get("tf") or "").strip().upper() or None
-
-    user.last_seen_at = datetime.now(timezone.utc)
-    user.last_seen_symbol = symbol
-    user.last_seen_tf = tf
-    user.last_seen_ip = request.headers.get("CF-Connecting-IP") or request.remote_addr
-
-    db.session.commit()
-    return jsonify({"ok": True})
-
-
-# -------------------------
-# Billing routes (frontend uses X-API-Key)
+# Billing (Stripe)
 # -------------------------
 @app.get("/billing/status")
 @limiter.limit("60 per minute")
@@ -685,18 +686,13 @@ def create_portal_session():
     if not user.stripe_customer_id:
         return json_error("No Stripe customer found for this user.", 400)
 
-    return_url = f"{APP_BASE_URL}/billing.html"
-
     portal = stripe.billing_portal.Session.create(
         customer=user.stripe_customer_id,
-        return_url=return_url,
+        return_url=f"{APP_BASE_URL}/billing.html",
     )
     return jsonify({"ok": True, "url": portal.url})
 
 
-# -------------------------
-# Stripe webhook
-# -------------------------
 @app.post("/stripe/webhook")
 def stripe_webhook():
     if not STRIPE_WEBHOOK_SECRET:
@@ -706,9 +702,7 @@ def stripe_webhook():
     sig_header = request.headers.get("Stripe-Signature", "")
 
     try:
-        event = stripe.Webhook.construct_event(
-            payload=payload, sig_header=sig_header, secret=STRIPE_WEBHOOK_SECRET
-        )
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except Exception:
         return json_error("Invalid webhook signature.", 400)
 
@@ -756,7 +750,7 @@ def stripe_webhook():
 
 
 # -------------------------
-# Trades routes
+# Trades
 # -------------------------
 @app.post("/api/v1/trades")
 @limiter.limit("120 per minute")
@@ -828,7 +822,7 @@ def get_trades():
 
 
 # -------------------------
-# Admin endpoints
+# Admin API
 # -------------------------
 @app.get("/admin/users")
 @limiter.limit("60 per minute")
@@ -839,11 +833,11 @@ def admin_users():
 
     q = (request.args.get("q") or "").strip().lower()
 
-    query = User.query
+    qry = User.query
     if q:
-        query = query.filter(User.email.ilike(f"%{q}%"))
+        qry = qry.filter(User.email.ilike(f"%{q}%"))
 
-    users = query.order_by(User.id.desc()).limit(200).all()
+    users = qry.order_by(User.id.desc()).limit(200).all()
 
     return jsonify({
         "ok": True,
@@ -853,9 +847,11 @@ def admin_users():
                 "email": u.email,
                 "plan": u.plan,
                 "subscription_status": u.subscription_status,
+                "enabled": bool(u.enabled),
                 "pairs": u.pairs,
-                "online": ea_connected(u),
+                "lot_size": u.lot_size,
                 "last_seen_at": u.last_seen_at.isoformat() if u.last_seen_at else None,
+                "online": is_online(u),
             }
             for u in users
         ]
@@ -898,6 +894,7 @@ def admin_user_activity(user_id):
             "last_seen_symbol": u.last_seen_symbol,
             "last_seen_tf": u.last_seen_tf,
             "last_seen_ip": u.last_seen_ip,
+            "online": is_online(u),
         },
         "trades": [
             {
@@ -909,51 +906,74 @@ def admin_user_activity(user_id):
                 "sl": t.sl,
                 "tp": t.tp,
                 "profit": t.profit,
-                "opened_at": t.opened_at.isoformat() if t.opened_at else None,
+                "deal_id": t.deal_id,
+                "opened_at": t.opened_at.isoformat(),
             }
             for t in trades
         ]
     })
 
 
-@app.post("/admin/user/<int:user_id>/disable")
+@app.post("/admin/user/<int:user_id>/force-disable")
 @limiter.limit("60 per minute")
-def admin_disable_user(user_id):
+def admin_force_disable(user_id):
     ok, err = require_admin()
     if err:
         return err
 
-    user = User.query.get(user_id)
-    if not user:
+    u = User.query.get(user_id)
+    if not u:
         return json_error("User not found", 404)
 
-    user.enabled = False
+    u.enabled = False
     db.session.commit()
-    return jsonify({"ok": True, "id": user.id, "enabled": False})
+    return jsonify({"ok": True, "id": u.id, "enabled": bool(u.enabled)})
 
 
-@app.post("/admin/user/<int:user_id>/enable")
+@app.post("/admin/user/<int:user_id>/force-enable")
 @limiter.limit("60 per minute")
-def admin_enable_user(user_id):
+def admin_force_enable(user_id):
     ok, err = require_admin()
     if err:
         return err
 
-    user = User.query.get(user_id)
-    if not user:
+    u = User.query.get(user_id)
+    if not u:
         return json_error("User not found", 404)
 
-    data = request.get_json(silent=True) or {}
-    force = bool(data.get("force", False))
+    # obey paywall rules
+    pay_err = ensure_can_trade(u)
+    if pay_err:
+        return pay_err
 
-    if not force:
-        pay_err = ensure_can_trade(user)
-        if pay_err:
-            return pay_err
-
-    user.enabled = True
+    u.enabled = True
     db.session.commit()
-    return jsonify({"ok": True, "id": user.id, "enabled": True, "forced": force})
+    return jsonify({"ok": True, "id": u.id, "enabled": bool(u.enabled)})
+
+
+# ✅ NEW: Admin rotate a user's API key (and disable EA for safety)
+@app.post("/admin/user/<int:user_id>/rotate-key")
+@limiter.limit("60 per minute")
+def admin_rotate_user_key(user_id):
+    ok, err = require_admin()
+    if err:
+        return err
+
+    u = User.query.get(user_id)
+    if not u:
+        return json_error("User not found", 404)
+
+    u.api_key = secrets.token_hex(24)
+    u.enabled = False
+    db.session.commit()
+
+    return jsonify({
+        "ok": True,
+        "id": u.id,
+        "email": u.email,
+        "enabled": bool(u.enabled),
+        "api_key": u.api_key
+    })
 
 
 # -------------------------
