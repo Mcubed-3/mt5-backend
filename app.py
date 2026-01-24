@@ -2,7 +2,7 @@ import os
 import secrets
 from datetime import datetime, timezone, timedelta
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -13,7 +13,9 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 import stripe
-import jwt  # PyJWT
+
+# JWT (PyJWT)
+import jwt
 
 
 # -------------------------
@@ -21,12 +23,31 @@ import jwt  # PyJWT
 # -------------------------
 app = Flask(__name__)
 
-FRONTEND_ORIGINS = ["https://676trades.org", "https://www.676trades.org"]
+FRONTEND_ORIGINS = [
+    "https://676trades.org",
+    "https://www.676trades.org",
+]
 
+# Secrets / JWT
+SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
+if not SECRET_KEY:
+    # You MUST set this in Render env vars in production.
+    # Using a random fallback would invalidate tokens on each restart.
+    raise RuntimeError("SECRET_KEY is required (set it in Render env vars).")
+
+JWT_ISSUER = os.getenv("JWT_ISSUER", "676trades").strip()
+JWT_EXPIRES_MIN = int(os.getenv("JWT_EXPIRES_MIN", "1440"))  # default 24h
+
+# Admin protection
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+
+# CORS:
+# - Allow Authorization (JWT) + X-API-Key + X-Admin-Token
+# - Allow OPTIONS preflight
 CORS(
     app,
     resources={r"/*": {"origins": FRONTEND_ORIGINS}},
-    allow_headers=["Content-Type", "X-API-Key", "Authorization", "X-Admin-Token"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key", "X-Admin-Token"],
     methods=["GET", "POST", "OPTIONS"],
 )
 
@@ -37,8 +58,10 @@ limiter = Limiter(
 )
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///db.sqlite3")
+
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
@@ -48,18 +71,12 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
 
 # -------------------------
-# JWT config
-# -------------------------
-JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
-JWT_EXP_MIN = int(os.getenv("JWT_EXP_MIN", "120"))  # 2 hours default
-
-# -------------------------
 # Stripe config
 # -------------------------
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "").strip()   # must be price_...
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
-APP_BASE_URL = os.getenv("APP_BASE_URL", "https://676trades.org").strip()
+APP_BASE_URL = os.getenv("APP_BASE_URL", "https://676trades.org").strip()  # frontend
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "5"))
 
 if STRIPE_SECRET_KEY:
@@ -81,11 +98,14 @@ class User(db.Model):
 
     enabled = db.Column(db.Boolean, default=False, nullable=False)
 
+    # Backward compatible single symbol
     pair = db.Column(db.String(20), default="XAUUSD", nullable=False)
+    # Multi symbols CSV
     pairs = db.Column(db.String(255), default="XAUUSD", nullable=False)
 
     lot_size = db.Column(db.Float, default=0.01, nullable=False)
 
+    # SL/TP settings
     sl_mode = db.Column(db.String(20), default="dynamic", nullable=False)
     tp_mode = db.Column(db.String(20), default="rr", nullable=False)
 
@@ -98,8 +118,9 @@ class User(db.Model):
     fixed_sl_pips = db.Column(db.Integer, default=50, nullable=False)
     fixed_tp_pips = db.Column(db.Integer, default=50, nullable=False)
 
-    plan = db.Column(db.String(20), default="free", nullable=False)
-    subscription_status = db.Column(db.String(30), default="none", nullable=False)
+    # Billing fields
+    plan = db.Column(db.String(20), default="free", nullable=False)  # free / pro
+    subscription_status = db.Column(db.String(30), default="none", nullable=False)  # none/active/past_due/canceled
     trial_ends_at = db.Column(db.DateTime, nullable=True)
 
     stripe_customer_id = db.Column(db.String(80), nullable=True, index=True)
@@ -108,11 +129,11 @@ class User(db.Model):
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     last_login_at = db.Column(db.DateTime, nullable=True)
 
-    # EA heartbeat
+    # Heartbeat / EA last seen (if you already added these previously, keep them)
     last_seen_at = db.Column(db.DateTime, nullable=True)
-    last_seen_symbol = db.Column(db.String(20), nullable=True)
-    last_seen_tf = db.Column(db.String(10), nullable=True)
     last_seen_ip = db.Column(db.String(64), nullable=True)
+    last_seen_symbol = db.Column(db.String(32), nullable=True)
+    last_seen_tf = db.Column(db.String(16), nullable=True)
 
 
 class Trade(db.Model):
@@ -135,6 +156,24 @@ class Trade(db.Model):
     profit = db.Column(db.Float, nullable=True)
 
     opened_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+# -------------------------
+# CORS Preflight Hardening
+# -------------------------
+@app.before_request
+def _preflight_ok():
+    # Some setups fail preflight due to limiter/OPTIONS handling.
+    # This guarantees OPTIONS returns OK + CORS headers.
+    if request.method == "OPTIONS":
+        origin = request.headers.get("Origin", "")
+        resp = make_response("")
+        if origin in FRONTEND_ORIGINS:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key, X-Admin-Token"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        return resp
 
 
 # -------------------------
@@ -182,6 +221,79 @@ def first_pair(pairs_csv: str) -> str:
         return "XAUUSD"
 
 
+# -------------------------
+# JWT helpers
+# -------------------------
+def create_jwt_for_user(user: User) -> str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "iss": JWT_ISSUER,
+        "sub": str(user.id),
+        "email": user.email,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=JWT_EXPIRES_MIN)).timestamp()),
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+
+
+def get_user_from_jwt():
+    auth = request.headers.get("Authorization", "").strip()
+    if not auth.startswith("Bearer "):
+        return None
+    token = auth.split(" ", 1)[1].strip()
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"], issuer=JWT_ISSUER)
+        uid = int(payload.get("sub"))
+        return User.query.get(uid)
+    except Exception:
+        return None
+
+
+def require_api_key():
+    api_key = request.headers.get("X-API-Key", "").strip()
+    if not api_key:
+        return None, json_error("Missing X-API-Key header", 401)
+
+    user = User.query.filter_by(api_key=api_key).first()
+    if not user:
+        return None, json_error("Invalid API key", 401)
+
+    return user, None
+
+
+def require_user():
+    """
+    Backward compatible:
+    - EA uses X-API-Key
+    - Frontend can use Bearer JWT
+    """
+    # 1) API key
+    api_key = request.headers.get("X-API-Key", "").strip()
+    if api_key:
+        user = User.query.filter_by(api_key=api_key).first()
+        if user:
+            return user, None
+        return None, json_error("Invalid API key", 401)
+
+    # 2) JWT
+    user = get_user_from_jwt()
+    if user:
+        return user, None
+
+    return None, json_error("Unauthorized", 401)
+
+
+def require_admin():
+    token = request.headers.get("X-Admin-Token", "").strip()
+    if not ADMIN_TOKEN:
+        return json_error("Admin not configured.", 500)
+    if not token or token != ADMIN_TOKEN:
+        return json_error("Unauthorized", 401)
+    return None
+
+
 def trial_active(user: User) -> bool:
     if not user.trial_ends_at:
         return False
@@ -207,62 +319,18 @@ def ensure_can_trade(user: User):
     return json_error("Payment required. Please start your free trial / subscribe.", 402)
 
 
-# -------------------------
-# JWT helpers
-# -------------------------
-def make_jwt(user: User) -> str:
-    if not JWT_SECRET:
-        raise RuntimeError("JWT_SECRET not set on server")
+def ea_connected(user: User, minutes: int = 5) -> bool:
+    if not user.last_seen_at:
+        return False
     now = datetime.now(timezone.utc)
-    payload = {
-        "sub": str(user.id),
-        "email": user.email,
-        "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(minutes=JWT_EXP_MIN)).timestamp()),
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
-
-
-def get_user_from_bearer():
-    auth = request.headers.get("Authorization", "").strip()
-    if not auth.lower().startswith("bearer "):
-        return None
-    token = auth.split(" ", 1)[1].strip()
-    if not token:
-        return None
-    try:
-        claims = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        uid = int(claims.get("sub"))
-        return User.query.get(uid)
-    except Exception:
-        return None
-
-
-def require_user():
-    """
-    Accept either:
-      - Authorization: Bearer <jwt>  (web app)
-      - X-API-Key: <api_key>         (EA + backwards compatibility)
-    """
-    u = None
-    if JWT_SECRET:
-        u = get_user_from_bearer()
-    if u:
-        return u, None
-
-    api_key = request.headers.get("X-API-Key", "").strip()
-    if not api_key:
-        return None, json_error("Missing auth (Bearer token or X-API-Key)", 401)
-
-    u = User.query.filter_by(api_key=api_key).first()
-    if not u:
-        return None, json_error("Invalid API key", 401)
-
-    return u, None
+    t = user.last_seen_at
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return now - t < timedelta(minutes=minutes)
 
 
 # -------------------------
-# Auto-migration
+# Auto-migration (keeps Postgres from breaking)
 # -------------------------
 def ensure_schema():
     uri = app.config["SQLALCHEMY_DATABASE_URI"]
@@ -284,7 +352,7 @@ def ensure_schema():
 
         def add_col(sql): conn.execute(text(sql))
 
-        # core
+        # base
         if "email" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN email VARCHAR(255)')
             add_col('CREATE UNIQUE INDEX IF NOT EXISTS ix_user_email ON "user"(email)')
@@ -305,6 +373,16 @@ def ensure_schema():
             add_col('ALTER TABLE "user" ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()')
         if "last_login_at" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN last_login_at TIMESTAMPTZ NULL')
+
+        # heartbeat fields
+        if "last_seen_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN last_seen_at TIMESTAMPTZ NULL')
+        if "last_seen_ip" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN last_seen_ip VARCHAR(64) NULL')
+        if "last_seen_symbol" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN last_seen_symbol VARCHAR(32) NULL')
+        if "last_seen_tf" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN last_seen_tf VARCHAR(16) NULL')
 
         # sl/tp
         if "sl_mode" not in cols:
@@ -338,17 +416,7 @@ def ensure_schema():
             add_col('ALTER TABLE "user" ADD COLUMN stripe_subscription_id VARCHAR(80) NULL')
             add_col('CREATE INDEX IF NOT EXISTS ix_user_stripe_subscription_id ON "user"(stripe_subscription_id)')
 
-        # heartbeat
-        if "last_seen_at" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN last_seen_at TIMESTAMPTZ NULL')
-        if "last_seen_symbol" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN last_seen_symbol VARCHAR(20) NULL')
-        if "last_seen_tf" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN last_seen_tf VARCHAR(10) NULL')
-        if "last_seen_ip" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN last_seen_ip VARCHAR(64) NULL')
-
-        # trades
+        # trade table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS trade (
                 id SERIAL PRIMARY KEY,
@@ -382,7 +450,7 @@ def health():
 
 
 # -------------------------
-# Routes: Auth
+# Routes: Auth (JWT + API key)
 # -------------------------
 @app.post("/auth/register")
 @limiter.limit("10 per hour")
@@ -415,10 +483,14 @@ def register():
         db.session.rollback()
         return json_error("Email already registered", 409)
 
-    out = {"ok": True, "message": "Registered", "api_key": api_key}
-    if JWT_SECRET:
-        out["jwt"] = make_jwt(user)
-    return jsonify(out)
+    token = create_jwt_for_user(user)
+
+    return jsonify({
+        "ok": True,
+        "message": "Registered",
+        "api_key": api_key,
+        "token": token,   # NEW (JWT)
+    })
 
 
 @app.post("/auth/login")
@@ -435,30 +507,30 @@ def login():
     user.last_login_at = datetime.now(timezone.utc)
     db.session.commit()
 
-    out = {"ok": True, "api_key": user.api_key}
-    if JWT_SECRET:
-        out["jwt"] = make_jwt(user)
-    return jsonify(out)
+    token = create_jwt_for_user(user)
+
+    return jsonify({
+        "ok": True,
+        "api_key": user.api_key,  # keep for EA / legacy frontend
+        "token": token,           # NEW (JWT)
+    })
 
 
 @app.post("/auth/rotate-key")
 @limiter.limit("10 per hour")
 def rotate_key():
-    data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
-    password = (data.get("password") or "").strip()
-
-    user = User.query.filter_by(email=email).first()
-    if not user or not check_password_hash(user.password_hash, password):
-        return json_error("Invalid email or password", 401)
+    # allow via JWT or API key
+    user, err = require_user()
+    if err:
+        return err
 
     user.api_key = secrets.token_hex(24)
     db.session.commit()
 
-    out = {"ok": True, "api_key": user.api_key}
-    if JWT_SECRET:
-        out["jwt"] = make_jwt(user)
-    return jsonify(out)
+    # rotate should also refresh JWT
+    token = create_jwt_for_user(user)
+
+    return jsonify({"ok": True, "api_key": user.api_key, "token": token})
 
 
 # -------------------------
@@ -472,16 +544,6 @@ def status():
         return err
 
     pairs_csv = (user.pairs or user.pair or "XAUUSD").strip() or "XAUUSD"
-
-    # heartbeat: online if seen within 5 minutes
-    online = False
-    last_seen_iso = None
-    if user.last_seen_at:
-        t = user.last_seen_at
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=timezone.utc)
-        last_seen_iso = t.isoformat()
-        online = (datetime.now(timezone.utc) - t) <= timedelta(minutes=5)
 
     return jsonify({
         "ok": True,
@@ -501,12 +563,14 @@ def status():
         "fixed_sl_pips": int(user.fixed_sl_pips),
         "fixed_tp_pips": int(user.fixed_tp_pips),
 
+        # billing snapshot
         "plan": user.plan,
         "subscription_status": user.subscription_status,
         "trial_ends_at": user.trial_ends_at.isoformat() if user.trial_ends_at else None,
 
-        "ea_connected": online,
-        "last_seen_at": last_seen_iso,
+        # EA heartbeat snapshot
+        "ea_connected": ea_connected(user),
+        "last_seen_at": user.last_seen_at.isoformat() if user.last_seen_at else None,
     })
 
 
@@ -622,27 +686,30 @@ def settings():
 
 
 # -------------------------
-# EA heartbeat endpoint
+# EA Heartbeat (POST from EA)
 # -------------------------
 @app.post("/api/v1/heartbeat")
-@limiter.limit("240 per minute")
+@limiter.limit("120 per minute")
 def heartbeat():
-    # EA should call this with X-API-Key (or JWT, but EA will use X-API-Key)
-    user, err = require_user()
+    user, err = require_api_key()  # EA uses X-API-Key
     if err:
         return err
 
     data = request.get_json(silent=True) or {}
+    symbol = (data.get("symbol") or "").strip().upper()[:32] or None
+    tf = (data.get("tf") or "").strip()[:16] or None
+
     user.last_seen_at = datetime.now(timezone.utc)
-    user.last_seen_symbol = (data.get("symbol") or "")[:20] or None
-    user.last_seen_tf = (data.get("tf") or "")[:10] or None
-    user.last_seen_ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "")[:64] or None
+    user.last_seen_ip = (request.headers.get("CF-Connecting-IP") or request.remote_addr or "")[:64]
+    user.last_seen_symbol = symbol
+    user.last_seen_tf = tf
     db.session.commit()
+
     return jsonify({"ok": True})
 
 
 # -------------------------
-# Billing routes
+# Billing routes (frontend uses JWT or X-API-Key)
 # -------------------------
 @app.get("/billing/status")
 @limiter.limit("60 per minute")
@@ -704,15 +771,50 @@ def create_portal_session():
 
     if not STRIPE_SECRET_KEY:
         return json_error("Stripe not configured on server.", 500)
+
     if not user.stripe_customer_id:
         return json_error("No Stripe customer found for this user.", 400)
 
     return_url = f"{APP_BASE_URL}/billing.html"
+
     portal = stripe.billing_portal.Session.create(
         customer=user.stripe_customer_id,
         return_url=return_url,
     )
     return jsonify({"ok": True, "url": portal.url})
+
+
+# -------------------------
+# Admin routes (example list users) - CORS now works
+# -------------------------
+@app.get("/admin/users")
+@limiter.limit("60 per minute")
+def admin_users():
+    err = require_admin()
+    if err:
+        return err
+
+    q = (request.args.get("q") or "").strip().lower()
+    query = User.query
+    if q:
+        query = query.filter(User.email.ilike(f"%{q}%"))
+
+    rows = query.order_by(User.id.desc()).limit(200).all()
+
+    items = []
+    for u in rows:
+        items.append({
+            "id": u.id,
+            "email": u.email,
+            "plan": u.plan,
+            "subscription_status": u.subscription_status,
+            "enabled": bool(u.enabled),
+            "pairs": u.pairs,
+            "online": ea_connected(u),
+            "last_seen_at": u.last_seen_at.isoformat() if u.last_seen_at else None,
+        })
+
+    return jsonify({"ok": True, "items": items})
 
 
 # -------------------------
@@ -754,7 +856,7 @@ def stripe_webhook():
     if etype in ("customer.subscription.updated", "customer.subscription.created", "customer.subscription.deleted"):
         customer_id = obj.get("customer")
         subscription_id = obj.get("id")
-        status = obj.get("status")  # active, trialing, past_due, canceled, unpaid, etc.
+        status = obj.get("status")
 
         user = get_user_by_customer(customer_id)
         if user:
@@ -782,7 +884,7 @@ def stripe_webhook():
 @app.post("/api/v1/trades")
 @limiter.limit("120 per minute")
 def post_trade():
-    user, err = require_user()
+    user, err = require_api_key()  # EA posts trades
     if err:
         return err
 
@@ -860,9 +962,15 @@ def add_security_headers(resp):
     return resp
 
 
+# -------------------------
+# Ensure schema exists
+# -------------------------
 with app.app_context():
     ensure_schema()
 
 
+# -------------------------
+# Local run
+# -------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
