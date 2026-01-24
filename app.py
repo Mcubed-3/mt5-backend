@@ -82,14 +82,11 @@ class User(db.Model):
 
     enabled = db.Column(db.Boolean, default=False, nullable=False)
 
-    # Backward compatible single symbol
     pair = db.Column(db.String(20), default="XAUUSD", nullable=False)
-    # Multi symbols CSV
     pairs = db.Column(db.String(255), default="XAUUSD", nullable=False)
 
     lot_size = db.Column(db.Float, default=0.01, nullable=False)
 
-    # SL/TP settings
     sl_mode = db.Column(db.String(20), default="dynamic", nullable=False)
     tp_mode = db.Column(db.String(20), default="rr", nullable=False)
 
@@ -103,7 +100,7 @@ class User(db.Model):
     fixed_tp_pips = db.Column(db.Integer, default=50, nullable=False)
 
     # Billing
-    plan = db.Column(db.String(20), default="free", nullable=False)  # free / pro
+    plan = db.Column(db.String(20), default="free", nullable=False)  # free/pro
     subscription_status = db.Column(db.String(30), default="none", nullable=False)  # none/active/past_due/canceled
     trial_ends_at = db.Column(db.DateTime, nullable=True)
 
@@ -445,7 +442,7 @@ def rotate_key():
 
 
 # -------------------------
-# EA Heartbeat (EA calls this)
+# EA Heartbeat
 # -------------------------
 @app.post("/api/v1/heartbeat")
 @limiter.limit("120 per minute")
@@ -498,7 +495,6 @@ def status():
         "subscription_status": user.subscription_status,
         "trial_ends_at": user.trial_ends_at.isoformat() if user.trial_ends_at else None,
 
-        # Heartbeat for dashboard indicator
         "ea_connected": is_online(user),
         "last_seen_at": user.last_seen_at.isoformat() if user.last_seen_at else None,
         "last_seen_symbol": user.last_seen_symbol,
@@ -542,7 +538,6 @@ def settings():
 
     data = request.get_json(silent=True) or {}
 
-    # accept "pairs" OR "pair"
     if "pairs" in data:
         try:
             user.pairs = normalize_pairs(str(data["pairs"]))
@@ -850,6 +845,7 @@ def admin_users():
                 "enabled": bool(u.enabled),
                 "pairs": u.pairs,
                 "lot_size": u.lot_size,
+                "trial_ends_at": u.trial_ends_at.isoformat() if u.trial_ends_at else None,
                 "last_seen_at": u.last_seen_at.isoformat() if u.last_seen_at else None,
                 "online": is_online(u),
             }
@@ -884,6 +880,7 @@ def admin_user_activity(user_id):
             "email": u.email,
             "plan": u.plan,
             "subscription_status": u.subscription_status,
+            "trial_ends_at": u.trial_ends_at.isoformat() if u.trial_ends_at else None,
             "enabled": bool(u.enabled),
             "pairs": u.pairs,
             "lot_size": u.lot_size,
@@ -941,7 +938,6 @@ def admin_force_enable(user_id):
     if not u:
         return json_error("User not found", 404)
 
-    # obey paywall rules
     pay_err = ensure_can_trade(u)
     if pay_err:
         return pay_err
@@ -951,7 +947,6 @@ def admin_force_enable(user_id):
     return jsonify({"ok": True, "id": u.id, "enabled": bool(u.enabled)})
 
 
-# ✅ NEW: Admin rotate a user's API key (and disable EA for safety)
 @app.post("/admin/user/<int:user_id>/rotate-key")
 @limiter.limit("60 per minute")
 def admin_rotate_user_key(user_id):
@@ -976,6 +971,77 @@ def admin_rotate_user_key(user_id):
     })
 
 
+# ✅ NEW: Admin billing override
+@app.post("/admin/user/<int:user_id>/set-billing")
+@limiter.limit("60 per minute")
+def admin_set_billing(user_id):
+    ok, err = require_admin()
+    if err:
+        return err
+
+    u = User.query.get(user_id)
+    if not u:
+        return json_error("User not found", 404)
+
+    data = request.get_json(silent=True) or {}
+
+    # allow keys: plan, subscription_status, trial_days, trial_until, disable_if_unpaid
+    plan = (data.get("plan") or "").strip().lower()
+    sub = (data.get("subscription_status") or "").strip().lower()
+
+    if plan:
+        if plan not in ("free", "pro"):
+            return json_error("plan must be free or pro", 400)
+        u.plan = plan
+
+    if sub:
+        if sub not in ("none", "active", "past_due", "canceled"):
+            return json_error("subscription_status must be none/active/past_due/canceled", 400)
+        u.subscription_status = sub
+
+    # trial_days: extend from now
+    if "trial_days" in data and data["trial_days"] is not None:
+        td = safe_int(data.get("trial_days"))
+        if td is None or td < 0 or td > 365:
+            return json_error("trial_days must be 0..365", 400)
+        if td == 0:
+            u.trial_ends_at = None
+        else:
+            u.trial_ends_at = datetime.now(timezone.utc) + timedelta(days=td)
+
+    # trial_until: ISO string
+    if "trial_until" in data and data["trial_until"]:
+        try:
+            # accept '2026-01-24T12:00:00Z' or without Z
+            s = str(data["trial_until"]).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            u.trial_ends_at = dt
+        except Exception:
+            return json_error("trial_until must be ISO date-time (e.g. 2026-01-24T12:00:00Z)", 400)
+
+    # optional: auto-disable EA if override makes them unpaid
+    disable_if_unpaid = bool(data.get("disable_if_unpaid", True))
+    if disable_if_unpaid:
+        if not (u.subscription_status == "active" or trial_active(u)):
+            u.enabled = False
+
+    db.session.commit()
+
+    return jsonify({
+        "ok": True,
+        "id": u.id,
+        "email": u.email,
+        "plan": u.plan,
+        "subscription_status": u.subscription_status,
+        "trial_ends_at": u.trial_ends_at.isoformat() if u.trial_ends_at else None,
+        "enabled": bool(u.enabled)
+    })
+
+
 # -------------------------
 # Security headers
 # -------------------------
@@ -988,15 +1054,9 @@ def add_security_headers(resp):
     return resp
 
 
-# -------------------------
-# Ensure schema exists
-# -------------------------
 with app.app_context():
     ensure_schema()
 
 
-# -------------------------
-# Local run
-# -------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
