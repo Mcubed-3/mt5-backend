@@ -52,7 +52,7 @@ db = SQLAlchemy(app)
 # Stripe config
 # -------------------------
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
-STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "").strip()  # price_...
+STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "").strip()  # must be price_...
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 APP_BASE_URL = os.getenv("APP_BASE_URL", "https://676trades.org").strip()
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "5"))
@@ -63,8 +63,7 @@ if STRIPE_SECRET_KEY:
 # -------------------------
 # Admin config
 # -------------------------
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
-HEARTBEAT_ONLINE_SECONDS = int(os.getenv("HEARTBEAT_ONLINE_SECONDS", "300"))  # 5 mins
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()  # set in Render env
 
 
 # -------------------------
@@ -82,25 +81,23 @@ class User(db.Model):
 
     enabled = db.Column(db.Boolean, default=False, nullable=False)
 
-    pair = db.Column(db.String(20), default="XAUUSD", nullable=False)
-    pairs = db.Column(db.String(255), default="XAUUSD", nullable=False)
+    pair = db.Column(db.String(20), default="XAUUSD", nullable=False)   # backward compatible
+    pairs = db.Column(db.String(255), default="XAUUSD", nullable=False) # CSV list
 
     lot_size = db.Column(db.Float, default=0.01, nullable=False)
 
+    # SL/TP settings
     sl_mode = db.Column(db.String(20), default="dynamic", nullable=False)
     tp_mode = db.Column(db.String(20), default="rr", nullable=False)
-
     min_pips = db.Column(db.Integer, default=50, nullable=False)
     sl_buffer_pips = db.Column(db.Integer, default=5, nullable=False)
-
     rr = db.Column(db.Float, default=1.0, nullable=False)
     pattern_tp_mult = db.Column(db.Float, default=1.5, nullable=False)
-
     fixed_sl_pips = db.Column(db.Integer, default=50, nullable=False)
     fixed_tp_pips = db.Column(db.Integer, default=50, nullable=False)
 
-    # Billing
-    plan = db.Column(db.String(20), default="free", nullable=False)  # free/pro
+    # Billing fields
+    plan = db.Column(db.String(20), default="free", nullable=False)  # free / pro
     subscription_status = db.Column(db.String(30), default="none", nullable=False)  # none/active/past_due/canceled
     trial_ends_at = db.Column(db.DateTime, nullable=True)
 
@@ -110,14 +107,17 @@ class User(db.Model):
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     last_login_at = db.Column(db.DateTime, nullable=True)
 
-    # EA Heartbeat
+    # Heartbeat + activity
     last_seen_at = db.Column(db.DateTime, nullable=True)
     last_seen_symbol = db.Column(db.String(20), nullable=True)
-    last_seen_tf = db.Column(db.String(10), nullable=True)
+    last_seen_tf = db.Column(db.String(20), nullable=True)
     last_seen_ip = db.Column(db.String(64), nullable=True)
 
-    # Activity tracking
     last_settings_at = db.Column(db.DateTime, nullable=True)
+
+    # Admin overrides (limits)
+    max_pairs_override = db.Column(db.Integer, nullable=True)
+    max_lot_override = db.Column(db.Float, nullable=True)
 
 
 class Trade(db.Model):
@@ -142,21 +142,6 @@ class Trade(db.Model):
     opened_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 
-class ErrorLog(db.Model):
-    __tablename__ = "error_log"
-
-    id = db.Column(db.Integer, primary_key=True)
-
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), index=True, nullable=True)
-    user = db.relationship("User", backref="errors")
-
-    source = db.Column(db.String(30), default="unknown", nullable=False)  # ea/frontend/backend
-    message = db.Column(db.String(800), nullable=False)
-    context = db.Column(db.String(1200), nullable=True)
-
-    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-
-
 # -------------------------
 # Helpers
 # -------------------------
@@ -176,23 +161,6 @@ def safe_int(v, default=None):
         return int(v)
     except Exception:
         return default
-
-
-def normalize_pairs(value: str) -> str:
-    parts = [p.strip().upper() for p in (value or "").split(",")]
-    parts = [p for p in parts if p]
-    for p in parts:
-        if len(p) < 3 or len(p) > 12:
-            raise ValueError("pair looks invalid")
-    seen = set()
-    out = []
-    for p in parts:
-        if p not in seen:
-            seen.add(p)
-            out.append(p)
-    if not out:
-        raise ValueError("pairs cannot be empty")
-    return ",".join(out)
 
 
 def first_pair(pairs_csv: str) -> str:
@@ -216,14 +184,18 @@ def require_api_key():
 
 def require_admin():
     if not ADMIN_TOKEN:
-        return None, json_error("Admin not configured on server.", 500)
-    token = request.headers.get("X-Admin-Token", "").strip()
-    if not token or token != ADMIN_TOKEN:
-        return None, json_error("Invalid admin token", 401)
-    return True, None
+        return json_error("Admin not configured on server (missing ADMIN_TOKEN).", 500)
+    tok = request.headers.get("X-Admin-Token", "").strip()
+    if not tok or tok != ADMIN_TOKEN:
+        return json_error("Unauthorized (invalid admin token).", 401)
+    return None
 
 
-def _as_utc(dt):
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+def as_utc(dt):
     if not dt:
         return None
     if dt.tzinfo is None:
@@ -231,24 +203,66 @@ def _as_utc(dt):
     return dt
 
 
-def is_online(user: User) -> bool:
-    if not user.last_seen_at:
-        return False
-    now = datetime.now(timezone.utc)
-    last = _as_utc(user.last_seen_at)
-    return (now - last).total_seconds() <= HEARTBEAT_ONLINE_SECONDS
-
-
 def trial_active(user: User) -> bool:
     if not user.trial_ends_at:
         return False
-    now = datetime.now(timezone.utc)
-    t = _as_utc(user.trial_ends_at)
-    return now < t
+    return utcnow() < as_utc(user.trial_ends_at)
 
 
 def is_paid_active(user: User) -> bool:
     return user.subscription_status == "active"
+
+
+def limits_for(user: User):
+    """
+    Defaults:
+      free: max_pairs=1, max_lot=0.10
+      pro : max_pairs=4, max_lot=5.00
+    Overrides if set.
+    """
+    if user.plan == "pro":
+        max_pairs = 4
+        max_lot = 5.0
+    else:
+        max_pairs = 1
+        max_lot = 0.10
+
+    if user.max_pairs_override is not None:
+        max_pairs = int(user.max_pairs_override)
+
+    if user.max_lot_override is not None:
+        max_lot = float(user.max_lot_override)
+
+    # final safety bounds
+    max_pairs = max(1, min(max_pairs, 50))
+    max_lot = max(0.01, min(max_lot, 100.0))
+
+    return max_pairs, max_lot
+
+
+def normalize_pairs(value: str, max_pairs: int) -> str:
+    parts = [p.strip().upper() for p in (value or "").split(",")]
+    parts = [p for p in parts if p]
+
+    for p in parts:
+        if len(p) < 3 or len(p) > 12:
+            raise ValueError("pair looks invalid")
+
+    # de-dup preserve order
+    seen = set()
+    out = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+
+    if not out:
+        raise ValueError("pairs cannot be empty")
+
+    if len(out) > max_pairs:
+        raise ValueError(f"Too many pairs. Your limit is {max_pairs}.")
+
+    return ",".join(out)
 
 
 def ensure_can_trade(user: User):
@@ -262,22 +276,14 @@ def ensure_can_trade(user: User):
     return json_error("Payment required. Please start your free trial / subscribe.", 402)
 
 
-def log_error(user_id, source, message, context=None):
-    try:
-        e = ErrorLog(
-            user_id=user_id,
-            source=(source or "unknown")[:30],
-            message=(message or "")[:800] or "unknown error",
-            context=(context or "")[:1200] or None,
-        )
-        db.session.add(e)
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
+def ea_connected(user: User, minutes: int = 5) -> bool:
+    if not user.last_seen_at:
+        return False
+    return (utcnow() - as_utc(user.last_seen_at)) <= timedelta(minutes=minutes)
 
 
 # -------------------------
-# Auto-migration (Postgres safe)
+# Auto-migration (Postgres safety)
 # -------------------------
 def ensure_schema():
     uri = app.config["SQLALCHEMY_DATABASE_URI"]
@@ -353,19 +359,25 @@ def ensure_schema():
             add_col('ALTER TABLE "user" ADD COLUMN stripe_subscription_id VARCHAR(80) NULL')
             add_col('CREATE INDEX IF NOT EXISTS ix_user_stripe_subscription_id ON "user"(stripe_subscription_id)')
 
-        # heartbeat + activity
+        # heartbeat/activity
         if "last_seen_at" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN last_seen_at TIMESTAMPTZ NULL')
         if "last_seen_symbol" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN last_seen_symbol VARCHAR(20) NULL')
         if "last_seen_tf" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN last_seen_tf VARCHAR(10) NULL')
+            add_col('ALTER TABLE "user" ADD COLUMN last_seen_tf VARCHAR(20) NULL')
         if "last_seen_ip" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN last_seen_ip VARCHAR(64) NULL')
         if "last_settings_at" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN last_settings_at TIMESTAMPTZ NULL')
 
-        # trades
+        # overrides/limits
+        if "max_pairs_override" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN max_pairs_override INTEGER NULL')
+        if "max_lot_override" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN max_lot_override DOUBLE PRECISION NULL')
+
+        # trade table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS trade (
                 id SERIAL PRIMARY KEY,
@@ -384,20 +396,6 @@ def ensure_schema():
         conn.execute(text('CREATE INDEX IF NOT EXISTS ix_trade_user_id ON trade(user_id)'))
         conn.execute(text('CREATE INDEX IF NOT EXISTS ix_trade_deal_id ON trade(deal_id)'))
 
-        # errors
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS error_log (
-                id SERIAL PRIMARY KEY,
-                user_id INTEGER NULL REFERENCES "user"(id),
-                source VARCHAR(30) NOT NULL DEFAULT 'unknown',
-                message VARCHAR(800) NOT NULL,
-                context VARCHAR(1200) NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """))
-        conn.execute(text('CREATE INDEX IF NOT EXISTS ix_error_log_user_id ON error_log(user_id)'))
-        conn.execute(text('CREATE INDEX IF NOT EXISTS ix_error_log_created_at ON error_log(created_at)'))
-
 
 # -------------------------
 # Routes: Health
@@ -413,7 +411,7 @@ def health():
 
 
 # -------------------------
-# Auth
+# Routes: Auth
 # -------------------------
 @app.post("/auth/register")
 @limiter.limit("10 per hour")
@@ -460,7 +458,7 @@ def login():
     if not user or not check_password_hash(user.password_hash, password):
         return json_error("Invalid email or password", 401)
 
-    user.last_login_at = datetime.now(timezone.utc)
+    user.last_login_at = utcnow()
     db.session.commit()
 
     return jsonify({"ok": True, "api_key": user.api_key})
@@ -485,25 +483,27 @@ def rotate_key():
 
 
 # -------------------------
-# Error logging (EA / frontend can call this)
+# Routes: Account (user)
 # -------------------------
-@app.post("/api/v1/log-error")
-@limiter.limit("120 per minute")
-def api_log_error():
+@app.get("/account/me")
+@limiter.limit("60 per minute")
+def account_me():
     user, err = require_api_key()
     if err:
         return err
 
-    data = request.get_json(silent=True) or {}
-    source = (data.get("source") or "ea").strip().lower()
-    message = (data.get("message") or "").strip()
-    context = (data.get("context") or "").strip()
-
-    if not message:
-        return json_error("message is required", 400)
-
-    log_error(user.id, source, message, context)
-    return jsonify({"ok": True})
+    return jsonify({
+        "ok": True,
+        "id": user.id,
+        "email": user.email,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
+        "pairs": user.pairs,
+        "lot_size": user.lot_size,
+        "plan": user.plan,
+        "subscription_status": user.subscription_status,
+        "trial_ends_at": user.trial_ends_at.isoformat() if user.trial_ends_at else None,
+    })
 
 
 # -------------------------
@@ -517,17 +517,23 @@ def heartbeat():
         return err
 
     data = request.get_json(silent=True) or {}
-    user.last_seen_at = datetime.now(timezone.utc)
-    user.last_seen_symbol = (data.get("symbol") or "").strip().upper() or user.last_seen_symbol
-    user.last_seen_tf = (data.get("tf") or "").strip().upper() or user.last_seen_tf
-    user.last_seen_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    sym = (data.get("symbol") or "").strip().upper()[:20] or None
+    tf = (data.get("tf") or "").strip()[:20] or None
+
+    user.last_seen_at = utcnow()
+    user.last_seen_symbol = sym
+    user.last_seen_tf = tf
+    user.last_seen_ip = (request.headers.get("CF-Connecting-IP")
+                         or request.headers.get("X-Forwarded-For")
+                         or request.remote_addr
+                         or "")[:64]
 
     db.session.commit()
     return jsonify({"ok": True})
 
 
 # -------------------------
-# Control (EA + Dashboard)
+# Routes: Control (EA + Dashboard)
 # -------------------------
 @app.get("/api/v1/status")
 @limiter.limit("120 per minute")
@@ -537,6 +543,7 @@ def status():
         return err
 
     pairs_csv = (user.pairs or user.pair or "XAUUSD").strip() or "XAUUSD"
+    max_pairs, max_lot = limits_for(user)
 
     return jsonify({
         "ok": True,
@@ -556,11 +563,18 @@ def status():
         "fixed_sl_pips": int(user.fixed_sl_pips),
         "fixed_tp_pips": int(user.fixed_tp_pips),
 
+        # billing snapshot
         "plan": user.plan,
         "subscription_status": user.subscription_status,
         "trial_ends_at": user.trial_ends_at.isoformat() if user.trial_ends_at else None,
+        "trial_active": trial_active(user),
 
-        "ea_connected": is_online(user),
+        # limits
+        "max_pairs": max_pairs,
+        "max_lot": max_lot,
+
+        # heartbeat snapshot
+        "ea_connected": ea_connected(user, minutes=5),
         "last_seen_at": user.last_seen_at.isoformat() if user.last_seen_at else None,
         "last_seen_symbol": user.last_seen_symbol,
         "last_seen_tf": user.last_seen_tf,
@@ -602,30 +616,33 @@ def settings():
         return pay_err
 
     data = request.get_json(silent=True) or {}
+    max_pairs, max_lot = limits_for(user)
 
+    # pairs
     if "pairs" in data:
         try:
-            user.pairs = normalize_pairs(str(data["pairs"]))
+            user.pairs = normalize_pairs(str(data["pairs"]), max_pairs=max_pairs)
             user.pair = first_pair(user.pairs)
         except ValueError as e:
             return json_error(str(e), 400)
 
     if "pair" in data and "pairs" not in data:
         try:
-            single = normalize_pairs(str(data["pair"]))
-            user.pairs = single
-            user.pair = first_pair(single)
+            user.pairs = normalize_pairs(str(data["pair"]), max_pairs=max_pairs)
+            user.pair = first_pair(user.pairs)
         except ValueError as e:
             return json_error(str(e), 400)
 
+    # lot size
     if "lot_size" in data:
         lot = safe_float(data["lot_size"])
         if lot is None:
             return json_error("lot_size must be a number", 400)
-        if lot <= 0 or lot > 100:
-            return json_error("lot_size out of range", 400)
+        if lot <= 0 or lot > max_lot:
+            return json_error(f"lot_size out of range. Your limit is {max_lot}.", 400)
         user.lot_size = lot
 
+    # sl/tp modes
     if "sl_mode" in data:
         sl_mode = str(data["sl_mode"]).strip().lower()
         if sl_mode not in ("dynamic", "fixed"):
@@ -638,6 +655,7 @@ def settings():
             return json_error("tp_mode must be rr, pattern_mult, or fixed", 400)
         user.tp_mode = tp_mode
 
+    # bounds
     if "min_pips" in data:
         v = safe_int(data["min_pips"])
         if v is None or v < 1 or v > 5000:
@@ -674,13 +692,13 @@ def settings():
             return json_error("fixed_tp_pips out of range", 400)
         user.fixed_tp_pips = v
 
-    user.last_settings_at = datetime.now(timezone.utc)
+    user.last_settings_at = utcnow()
     db.session.commit()
     return status()
 
 
 # -------------------------
-# Billing (Stripe)
+# Billing routes (frontend uses X-API-Key)
 # -------------------------
 @app.get("/billing/status")
 @limiter.limit("60 per minute")
@@ -714,7 +732,7 @@ def create_checkout_session():
         db.session.commit()
 
     if not user.trial_ends_at:
-        user.trial_ends_at = datetime.now(timezone.utc) + timedelta(days=TRIAL_DAYS)
+        user.trial_ends_at = utcnow() + timedelta(days=TRIAL_DAYS)
         db.session.commit()
 
     success_url = f"{APP_BASE_URL}/billing.html?success=1"
@@ -753,6 +771,9 @@ def create_portal_session():
     return jsonify({"ok": True, "url": portal.url})
 
 
+# -------------------------
+# Stripe webhook
+# -------------------------
 @app.post("/stripe/webhook")
 def stripe_webhook():
     if not STRIPE_WEBHOOK_SECRET:
@@ -762,7 +783,9 @@ def stripe_webhook():
     sig_header = request.headers.get("Stripe-Signature", "")
 
     try:
-        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+        event = stripe.Webhook.construct_event(
+            payload=payload, sig_header=sig_header, secret=STRIPE_WEBHOOK_SECRET
+        )
     except Exception:
         return json_error("Invalid webhook signature.", 400)
 
@@ -787,7 +810,7 @@ def stripe_webhook():
     if etype in ("customer.subscription.updated", "customer.subscription.created", "customer.subscription.deleted"):
         customer_id = obj.get("customer")
         subscription_id = obj.get("id")
-        status = obj.get("status")
+        status = obj.get("status")  # active, trialing, past_due, canceled...
 
         user = get_user_by_customer(customer_id)
         if user:
@@ -810,7 +833,7 @@ def stripe_webhook():
 
 
 # -------------------------
-# Trades
+# Trades routes
 # -------------------------
 @app.post("/api/v1/trades")
 @limiter.limit("120 per minute")
@@ -882,47 +905,43 @@ def get_trades():
 
 
 # -------------------------
-# Admin API
+# Admin endpoints
 # -------------------------
 @app.get("/admin/users")
 @limiter.limit("60 per minute")
 def admin_users():
-    ok, err = require_admin()
+    err = require_admin()
     if err:
         return err
 
     q = (request.args.get("q") or "").strip().lower()
-
     qry = User.query
     if q:
         qry = qry.filter(User.email.ilike(f"%{q}%"))
 
-    users = qry.order_by(User.id.desc()).limit(200).all()
+    rows = qry.order_by(User.id.desc()).limit(500).all()
 
-    return jsonify({
-        "ok": True,
-        "items": [
-            {
-                "id": u.id,
-                "email": u.email,
-                "plan": u.plan,
-                "subscription_status": u.subscription_status,
-                "enabled": bool(u.enabled),
-                "pairs": u.pairs,
-                "lot_size": u.lot_size,
-                "trial_ends_at": u.trial_ends_at.isoformat() if u.trial_ends_at else None,
-                "last_seen_at": u.last_seen_at.isoformat() if u.last_seen_at else None,
-                "online": is_online(u),
-            }
-            for u in users
-        ]
-    })
+    items = []
+    for u in rows:
+        items.append({
+            "id": u.id,
+            "email": u.email,
+            "plan": u.plan,
+            "subscription_status": u.subscription_status,
+            "enabled": bool(u.enabled),
+            "pairs": u.pairs,
+            "lot_size": float(u.lot_size),
+            "last_seen_at": u.last_seen_at.isoformat() if u.last_seen_at else None,
+            "online": ea_connected(u, minutes=5),
+        })
+
+    return jsonify({"ok": True, "items": items})
 
 
 @app.get("/admin/user/<int:user_id>/activity")
 @limiter.limit("60 per minute")
-def admin_user_activity(user_id):
-    ok, err = require_admin()
+def admin_user_activity(user_id: int):
+    err = require_admin()
     if err:
         return err
 
@@ -934,7 +953,7 @@ def admin_user_activity(user_id):
         Trade.query
         .filter_by(user_id=u.id)
         .order_by(Trade.id.desc())
-        .limit(50)
+        .limit(25)
         .all()
     )
 
@@ -948,7 +967,7 @@ def admin_user_activity(user_id):
             "trial_ends_at": u.trial_ends_at.isoformat() if u.trial_ends_at else None,
             "enabled": bool(u.enabled),
             "pairs": u.pairs,
-            "lot_size": u.lot_size,
+            "lot_size": float(u.lot_size),
             "created_at": u.created_at.isoformat() if u.created_at else None,
             "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None,
             "last_settings_at": u.last_settings_at.isoformat() if u.last_settings_at else None,
@@ -956,7 +975,8 @@ def admin_user_activity(user_id):
             "last_seen_symbol": u.last_seen_symbol,
             "last_seen_tf": u.last_seen_tf,
             "last_seen_ip": u.last_seen_ip,
-            "online": is_online(u),
+            "max_pairs_override": u.max_pairs_override,
+            "max_lot_override": u.max_lot_override,
         },
         "trades": [
             {
@@ -967,73 +987,19 @@ def admin_user_activity(user_id):
                 "entry": t.entry,
                 "sl": t.sl,
                 "tp": t.tp,
-                "profit": t.profit,
                 "deal_id": t.deal_id,
+                "profit": t.profit,
                 "opened_at": t.opened_at.isoformat(),
             }
             for t in trades
-        ]
+        ],
     })
-
-
-@app.post("/admin/user/<int:user_id>/force-disable")
-@limiter.limit("60 per minute")
-def admin_force_disable(user_id):
-    ok, err = require_admin()
-    if err:
-        return err
-
-    u = User.query.get(user_id)
-    if not u:
-        return json_error("User not found", 404)
-
-    u.enabled = False
-    db.session.commit()
-    return jsonify({"ok": True, "id": u.id, "enabled": bool(u.enabled)})
 
 
 @app.post("/admin/user/<int:user_id>/force-enable")
 @limiter.limit("60 per minute")
-def admin_force_enable(user_id):
-    ok, err = require_admin()
-    if err:
-        return err
-
-    u = User.query.get(user_id)
-    if not u:
-        return json_error("User not found", 404)
-
-    pay_err = ensure_can_trade(u)
-    if pay_err:
-        return pay_err
-
-    u.enabled = True
-    db.session.commit()
-    return jsonify({"ok": True, "id": u.id, "enabled": bool(u.enabled)})
-
-
-@app.post("/admin/user/<int:user_id>/rotate-key")
-@limiter.limit("60 per minute")
-def admin_rotate_user_key(user_id):
-    ok, err = require_admin()
-    if err:
-        return err
-
-    u = User.query.get(user_id)
-    if not u:
-        return json_error("User not found", 404)
-
-    u.api_key = secrets.token_hex(24)
-    u.enabled = False
-    db.session.commit()
-
-    return jsonify({"ok": True, "id": u.id, "email": u.email, "enabled": bool(u.enabled), "api_key": u.api_key})
-
-
-@app.post("/admin/user/<int:user_id>/set-billing")
-@limiter.limit("60 per minute")
-def admin_set_billing(user_id):
-    ok, err = require_admin()
+def admin_force_enable(user_id: int):
+    err = require_admin()
     if err:
         return err
 
@@ -1042,81 +1008,84 @@ def admin_set_billing(user_id):
         return json_error("User not found", 404)
 
     data = request.get_json(silent=True) or {}
+    enabled = bool(data.get("enabled", False))
 
+    u.enabled = enabled
+    db.session.commit()
+
+    return jsonify({"ok": True, "id": u.id, "enabled": bool(u.enabled)})
+
+
+@app.post("/admin/user/<int:user_id>/rotate-api-key")
+@limiter.limit("30 per minute")
+def admin_rotate_api_key(user_id: int):
+    err = require_admin()
+    if err:
+        return err
+
+    u = User.query.get(user_id)
+    if not u:
+        return json_error("User not found", 404)
+
+    # rotate key = force logout + EA stops until updated
+    u.api_key = secrets.token_hex(24)
+    u.enabled = False
+    db.session.commit()
+
+    return jsonify({"ok": True, "id": u.id, "api_key": u.api_key})
+
+
+@app.post("/admin/user/<int:user_id>/set-billing")
+@limiter.limit("60 per minute")
+def admin_set_billing(user_id: int):
+    err = require_admin()
+    if err:
+        return err
+
+    u = User.query.get(user_id)
+    if not u:
+        return json_error("User not found", 404)
+
+    data = request.get_json(silent=True) or {}
     plan = (data.get("plan") or "").strip().lower()
     sub = (data.get("subscription_status") or "").strip().lower()
 
+    if plan and plan not in ("free", "pro"):
+        return json_error("plan must be free or pro", 400)
+
+    if sub and sub not in ("none", "active", "past_due", "canceled"):
+        return json_error("subscription_status must be none/active/past_due/canceled", 400)
+
     if plan:
-        if plan not in ("free", "pro"):
-            return json_error("plan must be free or pro", 400)
         u.plan = plan
 
     if sub:
-        if sub not in ("none", "active", "past_due", "canceled"):
-            return json_error("subscription_status must be none/active/past_due/canceled", 400)
         u.subscription_status = sub
+        if sub != "active":
+            u.enabled = False
 
-    if "trial_days" in data and data["trial_days"] is not None:
+    # optional: set trial_ends_at offset days
+    if "trial_days" in data:
         td = safe_int(data.get("trial_days"))
         if td is None or td < 0 or td > 365:
-            return json_error("trial_days must be 0..365", 400)
-        if td == 0:
-            u.trial_ends_at = None
-        else:
-            u.trial_ends_at = datetime.now(timezone.utc) + timedelta(days=td)
-
-    if "trial_until" in data and data["trial_until"]:
-        try:
-            s = str(data["trial_until"]).strip()
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            dt = datetime.fromisoformat(s)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            u.trial_ends_at = dt
-        except Exception:
-            return json_error("trial_until must be ISO date-time (e.g. 2026-02-01T00:00:00Z)", 400)
-
-    disable_if_unpaid = bool(data.get("disable_if_unpaid", True))
-    if disable_if_unpaid:
-        if not (u.subscription_status == "active" or trial_active(u)):
-            u.enabled = False
+            return json_error("trial_days out of range (0..365)", 400)
+        u.trial_ends_at = (utcnow() + timedelta(days=td)) if td > 0 else None
 
     db.session.commit()
 
     return jsonify({
         "ok": True,
         "id": u.id,
-        "email": u.email,
         "plan": u.plan,
         "subscription_status": u.subscription_status,
         "trial_ends_at": u.trial_ends_at.isoformat() if u.trial_ends_at else None,
-        "enabled": bool(u.enabled)
     })
 
 
-# ✅ NEW: Clear a user's trades
-@app.post("/admin/user/<int:user_id>/clear-trades")
+@app.post("/admin/user/<int:user_id>/set-trading")
 @limiter.limit("60 per minute")
-def admin_clear_trades(user_id):
-    ok, err = require_admin()
-    if err:
-        return err
-
-    u = User.query.get(user_id)
-    if not u:
-        return json_error("User not found", 404)
-
-    deleted = Trade.query.filter_by(user_id=u.id).delete()
-    db.session.commit()
-    return jsonify({"ok": True, "id": u.id, "deleted": int(deleted)})
-
-
-# ✅ NEW: Reset user password (returns temp password)
-@app.post("/admin/user/<int:user_id>/reset-password")
-@limiter.limit("60 per minute")
-def admin_reset_password(user_id):
-    ok, err = require_admin()
+def admin_set_trading(user_id: int):
+    err = require_admin()
     if err:
         return err
 
@@ -1125,65 +1094,57 @@ def admin_reset_password(user_id):
         return json_error("User not found", 404)
 
     data = request.get_json(silent=True) or {}
-    new_password = (data.get("new_password") or "").strip()
 
-    if not new_password:
-        # generate a temp password
-        new_password = secrets.token_urlsafe(9)  # ~12 chars
+    # admin can set pairs/lot ignoring plan, but still keep some bounds
+    if "pairs" in data:
+        # use a high cap but still validate format
+        try:
+            pairs_csv = normalize_pairs(str(data["pairs"]), max_pairs=50)
+            u.pairs = pairs_csv
+            u.pair = first_pair(pairs_csv)
+        except ValueError as e:
+            return json_error(str(e), 400)
 
-    if len(new_password) < 8:
-        return json_error("Password must be at least 8 characters", 400)
+    if "lot_size" in data:
+        lot = safe_float(data.get("lot_size"))
+        if lot is None or lot <= 0 or lot > 100:
+            return json_error("lot_size out of range (0..100)", 400)
+        u.lot_size = lot
 
-    u.password_hash = generate_password_hash(new_password)
-    u.enabled = False  # safety: disable EA until user confirms access
+    # overrides (nullable)
+    if "max_pairs_override" in data:
+        v = data.get("max_pairs_override")
+        if v is None or v == "":
+            u.max_pairs_override = None
+        else:
+            iv = safe_int(v)
+            if iv is None or iv < 1 or iv > 50:
+                return json_error("max_pairs_override out of range (1..50)", 400)
+            u.max_pairs_override = iv
+
+    if "max_lot_override" in data:
+        v = data.get("max_lot_override")
+        if v is None or v == "":
+            u.max_lot_override = None
+        else:
+            fv = safe_float(v)
+            if fv is None or fv < 0.01 or fv > 100:
+                return json_error("max_lot_override out of range (0.01..100)", 400)
+            u.max_lot_override = fv
+
+    u.last_settings_at = utcnow()
     db.session.commit()
 
-    return jsonify({"ok": True, "id": u.id, "email": u.email, "temp_password": new_password, "enabled": bool(u.enabled)})
-
-
-# ✅ NEW: Admin errors viewer
-@app.get("/admin/errors")
-@limiter.limit("60 per minute")
-def admin_errors():
-    ok, err = require_admin()
-    if err:
-        return err
-
-    limit = safe_int(request.args.get("limit", 100), 100)
-    limit = max(1, min(limit, 300))
-
-    user_id = request.args.get("user_id", None)
-    q = (request.args.get("q") or "").strip().lower()
-
-    qry = ErrorLog.query
-
-    if user_id:
-        try:
-            uid = int(user_id)
-            qry = qry.filter(ErrorLog.user_id == uid)
-        except Exception:
-            return json_error("user_id must be an integer", 400)
-
-    if q:
-        qry = qry.filter(
-            (ErrorLog.message.ilike(f"%{q}%")) | (ErrorLog.context.ilike(f"%{q}%"))
-        )
-
-    rows = qry.order_by(ErrorLog.id.desc()).limit(limit).all()
-
+    max_pairs, max_lot = limits_for(u)
     return jsonify({
         "ok": True,
-        "items": [
-            {
-                "id": r.id,
-                "user_id": r.user_id,
-                "source": r.source,
-                "message": r.message,
-                "context": r.context,
-                "created_at": r.created_at.isoformat() if r.created_at else None,
-            }
-            for r in rows
-        ]
+        "id": u.id,
+        "pairs": u.pairs,
+        "lot_size": u.lot_size,
+        "max_pairs": max_pairs,
+        "max_lot": max_lot,
+        "max_pairs_override": u.max_pairs_override,
+        "max_lot_override": u.max_lot_override,
     })
 
 
@@ -1199,9 +1160,15 @@ def add_security_headers(resp):
     return resp
 
 
+# -------------------------
+# Ensure schema exists
+# -------------------------
 with app.app_context():
     ensure_schema()
 
 
+# -------------------------
+# Local run
+# -------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
