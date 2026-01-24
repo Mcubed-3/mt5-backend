@@ -1,8 +1,12 @@
 import os
 import secrets
+import base64
+import hmac
+import hashlib
+import json
 from datetime import datetime, timezone, timedelta
 
-from flask import Flask, request, jsonify, make_response
+from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -14,10 +18,6 @@ from flask_limiter.util import get_remote_address
 
 import stripe
 
-# JWT (PyJWT)
-import jwt
-
-
 # -------------------------
 # App / Config
 # -------------------------
@@ -28,22 +28,7 @@ FRONTEND_ORIGINS = [
     "https://www.676trades.org",
 ]
 
-# Secrets / JWT
-SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
-if not SECRET_KEY:
-    # You MUST set this in Render env vars in production.
-    # Using a random fallback would invalidate tokens on each restart.
-    raise RuntimeError("SECRET_KEY is required (set it in Render env vars).")
-
-JWT_ISSUER = os.getenv("JWT_ISSUER", "676trades").strip()
-JWT_EXPIRES_MIN = int(os.getenv("JWT_EXPIRES_MIN", "1440"))  # default 24h
-
-# Admin protection
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
-
-# CORS:
-# - Allow Authorization (JWT) + X-API-Key + X-Admin-Token
-# - Allow OPTIONS preflight
+# CORS must allow admin + jwt headers
 CORS(
     app,
     resources={r"/*": {"origins": FRONTEND_ORIGINS}},
@@ -68,7 +53,19 @@ if DATABASE_URL.startswith("postgresql://"):
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
+# Used by Flask (not JWT)
+app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", secrets.token_hex(32))
+
 db = SQLAlchemy(app)
+
+# -------------------------
+# Security / Admin config
+# -------------------------
+JWT_SECRET = os.getenv("JWT_SECRET", "").strip() or os.getenv("SECRET_KEY", "").strip() or app.config["SECRET_KEY"]
+JWT_EXPIRES_MIN = int(os.getenv("JWT_EXPIRES_MIN", "120"))
+
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+ADMIN_ALLOWED_IPS = [x.strip() for x in os.getenv("ADMIN_ALLOWED_IPS", "").split(",") if x.strip()]
 
 # -------------------------
 # Stripe config
@@ -76,7 +73,7 @@ db = SQLAlchemy(app)
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "").strip()   # must be price_...
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
-APP_BASE_URL = os.getenv("APP_BASE_URL", "https://676trades.org").strip()  # frontend
+APP_BASE_URL = os.getenv("APP_BASE_URL", "https://676trades.org").strip()
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "5"))
 
 if STRIPE_SECRET_KEY:
@@ -94,6 +91,7 @@ class User(db.Model):
     email = db.Column(db.String(255), unique=True, nullable=False, index=True)
     password_hash = db.Column(db.String(255), nullable=False)
 
+    # EA auth (unchanged)
     api_key = db.Column(db.String(64), unique=True, nullable=False, index=True)
 
     enabled = db.Column(db.Boolean, default=False, nullable=False)
@@ -126,14 +124,26 @@ class User(db.Model):
     stripe_customer_id = db.Column(db.String(80), nullable=True, index=True)
     stripe_subscription_id = db.Column(db.String(80), nullable=True, index=True)
 
+    # Heartbeat fields
+    last_seen_at = db.Column(db.DateTime, nullable=True)
+    last_seen_symbol = db.Column(db.String(20), nullable=True)
+    last_seen_tf = db.Column(db.String(10), nullable=True)
+    last_seen_ip = db.Column(db.String(64), nullable=True)
+
+    # Web/app fields
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     last_login_at = db.Column(db.DateTime, nullable=True)
+    last_settings_at = db.Column(db.DateTime, nullable=True)
 
-    # Heartbeat / EA last seen (if you already added these previously, keep them)
-    last_seen_at = db.Column(db.DateTime, nullable=True)
-    last_seen_ip = db.Column(db.String(64), nullable=True)
-    last_seen_symbol = db.Column(db.String(32), nullable=True)
-    last_seen_tf = db.Column(db.String(16), nullable=True)
+    # JWT invalidation (force logout)
+    token_version = db.Column(db.Integer, default=0, nullable=False)
+
+    # Optional: risk acknowledgement timestamp
+    risk_ack_at = db.Column(db.DateTime, nullable=True)
+
+    # Password reset (token stored hashed)
+    reset_token_hash = db.Column(db.String(128), nullable=True)
+    reset_token_expires_at = db.Column(db.DateTime, nullable=True)
 
 
 class Trade(db.Model):
@@ -156,24 +166,6 @@ class Trade(db.Model):
     profit = db.Column(db.Float, nullable=True)
 
     opened_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-
-
-# -------------------------
-# CORS Preflight Hardening
-# -------------------------
-@app.before_request
-def _preflight_ok():
-    # Some setups fail preflight due to limiter/OPTIONS handling.
-    # This guarantees OPTIONS returns OK + CORS headers.
-    if request.method == "OPTIONS":
-        origin = request.headers.get("Origin", "")
-        resp = make_response("")
-        if origin in FRONTEND_ORIGINS:
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Vary"] = "Origin"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key, X-Admin-Token"
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        return resp
 
 
 # -------------------------
@@ -221,34 +213,98 @@ def first_pair(pairs_csv: str) -> str:
         return "XAUUSD"
 
 
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def dt_iso(dt):
+    return dt.isoformat() if dt else None
+
+
+def client_ip():
+    # If you put Cloudflare in front, this header is set:
+    cf = request.headers.get("CF-Connecting-IP", "").strip()
+    if cf:
+        return cf
+    # Render / proxies may set X-Forwarded-For:
+    xff = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+    if xff:
+        return xff
+    return request.remote_addr or ""
+
+
 # -------------------------
-# JWT helpers
+# JWT (simple HS256)
 # -------------------------
-def create_jwt_for_user(user: User) -> str:
-    now = datetime.now(timezone.utc)
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+def _b64url_decode(s: str) -> bytes:
+    pad = "=" * ((4 - len(s) % 4) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+
+def jwt_encode(payload: dict) -> str:
+    header = {"alg": "HS256", "typ": "JWT"}
+    h = _b64url(json.dumps(header, separators=(",", ":")).encode())
+    p = _b64url(json.dumps(payload, separators=(",", ":")).encode())
+    msg = f"{h}.{p}".encode()
+    sig = hmac.new(JWT_SECRET.encode(), msg, hashlib.sha256).digest()
+    return f"{h}.{p}.{_b64url(sig)}"
+
+
+def jwt_decode(token: str) -> dict:
+    try:
+        h, p, s = token.split(".")
+        msg = f"{h}.{p}".encode()
+        sig = _b64url_decode(s)
+        exp_sig = hmac.new(JWT_SECRET.encode(), msg, hashlib.sha256).digest()
+        if not hmac.compare_digest(sig, exp_sig):
+            raise ValueError("bad signature")
+        payload = json.loads(_b64url_decode(p).decode())
+        return payload
+    except Exception:
+        raise ValueError("invalid token")
+
+
+def issue_access_token(user: User) -> str:
+    exp = int((now_utc() + timedelta(minutes=JWT_EXPIRES_MIN)).timestamp())
     payload = {
-        "iss": JWT_ISSUER,
-        "sub": str(user.id),
+        "sub": user.id,
         "email": user.email,
-        "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(minutes=JWT_EXPIRES_MIN)).timestamp()),
+        "tv": int(user.token_version),
+        "exp": exp,
     }
-    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+    return jwt_encode(payload)
 
 
-def get_user_from_jwt():
+def require_jwt():
     auth = request.headers.get("Authorization", "").strip()
     if not auth.startswith("Bearer "):
-        return None
+        return None, json_error("Missing Authorization Bearer token", 401)
     token = auth.split(" ", 1)[1].strip()
-    if not token:
-        return None
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"], issuer=JWT_ISSUER)
-        uid = int(payload.get("sub"))
-        return User.query.get(uid)
+        payload = jwt_decode(token)
     except Exception:
-        return None
+        return None, json_error("Invalid token", 401)
+
+    exp = payload.get("exp")
+    if not exp or int(exp) < int(now_utc().timestamp()):
+        return None, json_error("Token expired", 401)
+
+    uid = payload.get("sub")
+    if not uid:
+        return None, json_error("Invalid token", 401)
+
+    user = User.query.get(int(uid))
+    if not user:
+        return None, json_error("Invalid token", 401)
+
+    if int(payload.get("tv", -1)) != int(user.token_version):
+        return None, json_error("Session invalidated. Please login again.", 401)
+
+    return user, None
 
 
 def require_api_key():
@@ -263,45 +319,13 @@ def require_api_key():
     return user, None
 
 
-def require_user():
-    """
-    Backward compatible:
-    - EA uses X-API-Key
-    - Frontend can use Bearer JWT
-    """
-    # 1) API key
-    api_key = request.headers.get("X-API-Key", "").strip()
-    if api_key:
-        user = User.query.filter_by(api_key=api_key).first()
-        if user:
-            return user, None
-        return None, json_error("Invalid API key", 401)
-
-    # 2) JWT
-    user = get_user_from_jwt()
-    if user:
-        return user, None
-
-    return None, json_error("Unauthorized", 401)
-
-
-def require_admin():
-    token = request.headers.get("X-Admin-Token", "").strip()
-    if not ADMIN_TOKEN:
-        return json_error("Admin not configured.", 500)
-    if not token or token != ADMIN_TOKEN:
-        return json_error("Unauthorized", 401)
-    return None
-
-
 def trial_active(user: User) -> bool:
     if not user.trial_ends_at:
         return False
-    now = datetime.now(timezone.utc)
     t = user.trial_ends_at
     if t.tzinfo is None:
         t = t.replace(tzinfo=timezone.utc)
-    return now < t
+    return now_utc() < t
 
 
 def is_paid_active(user: User) -> bool:
@@ -311,26 +335,42 @@ def is_paid_active(user: User) -> bool:
 def ensure_can_trade(user: User):
     if is_paid_active(user) or trial_active(user):
         return None
-
     if user.enabled:
         user.enabled = False
         db.session.commit()
-
     return json_error("Payment required. Please start your free trial / subscribe.", 402)
 
 
-def ea_connected(user: User, minutes: int = 5) -> bool:
+def ea_connected(user: User, minutes=5) -> bool:
     if not user.last_seen_at:
         return False
-    now = datetime.now(timezone.utc)
     t = user.last_seen_at
     if t.tzinfo is None:
         t = t.replace(tzinfo=timezone.utc)
-    return now - t < timedelta(minutes=minutes)
+    return now_utc() - t < timedelta(minutes=minutes)
 
 
 # -------------------------
-# Auto-migration (keeps Postgres from breaking)
+# Admin auth + IP lock
+# -------------------------
+def require_admin():
+    if not ADMIN_TOKEN:
+        return False, json_error("Admin not configured on server.", 500)
+
+    token = request.headers.get("X-Admin-Token", "").strip()
+    if token != ADMIN_TOKEN:
+        return False, json_error("Unauthorized", 401)
+
+    if ADMIN_ALLOWED_IPS:
+        ip = client_ip()
+        if ip not in ADMIN_ALLOWED_IPS:
+            return False, json_error("Forbidden (IP not allowed)", 403)
+
+    return True, None
+
+
+# -------------------------
+# Auto-migration (Postgres safe)
 # -------------------------
 def ensure_schema():
     uri = app.config["SQLALCHEMY_DATABASE_URI"]
@@ -373,16 +413,8 @@ def ensure_schema():
             add_col('ALTER TABLE "user" ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()')
         if "last_login_at" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN last_login_at TIMESTAMPTZ NULL')
-
-        # heartbeat fields
-        if "last_seen_at" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN last_seen_at TIMESTAMPTZ NULL')
-        if "last_seen_ip" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN last_seen_ip VARCHAR(64) NULL')
-        if "last_seen_symbol" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN last_seen_symbol VARCHAR(32) NULL')
-        if "last_seen_tf" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN last_seen_tf VARCHAR(16) NULL')
+        if "last_settings_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN last_settings_at TIMESTAMPTZ NULL')
 
         # sl/tp
         if "sl_mode" not in cols:
@@ -416,6 +448,26 @@ def ensure_schema():
             add_col('ALTER TABLE "user" ADD COLUMN stripe_subscription_id VARCHAR(80) NULL')
             add_col('CREATE INDEX IF NOT EXISTS ix_user_stripe_subscription_id ON "user"(stripe_subscription_id)')
 
+        # heartbeat
+        if "last_seen_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN last_seen_at TIMESTAMPTZ NULL')
+        if "last_seen_symbol" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN last_seen_symbol VARCHAR(20) NULL')
+        if "last_seen_tf" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN last_seen_tf VARCHAR(10) NULL')
+        if "last_seen_ip" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN last_seen_ip VARCHAR(64) NULL')
+
+        # jwt invalidation + risk + reset
+        if "token_version" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0')
+        if "risk_ack_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN risk_ack_at TIMESTAMPTZ NULL')
+        if "reset_token_hash" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN reset_token_hash VARCHAR(128) NULL')
+        if "reset_token_expires_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN reset_token_expires_at TIMESTAMPTZ NULL')
+
         # trade table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS trade (
@@ -437,11 +489,19 @@ def ensure_schema():
 
 
 # -------------------------
+# Preflight helper (OPTIONS)
+# -------------------------
+@app.route("/<path:_any>", methods=["OPTIONS"])
+def any_options(_any):
+    return ("", 204)
+
+
+# -------------------------
 # Routes: Health
 # -------------------------
 @app.get("/")
 def root():
-    return jsonify({"ok": True, "service": "mt5-control-backend", "version": "v1"})
+    return jsonify({"ok": True, "service": "mt5-control-backend", "version": "v2-jwt-admin"})
 
 
 @app.get("/health")
@@ -450,7 +510,7 @@ def health():
 
 
 # -------------------------
-# Routes: Auth (JWT + API key)
+# Routes: Auth (JWT for website)
 # -------------------------
 @app.post("/auth/register")
 @limiter.limit("10 per hour")
@@ -474,6 +534,7 @@ def register():
         lot_size=0.01,
         plan="free",
         subscription_status="none",
+        token_version=0,
     )
 
     try:
@@ -483,14 +544,8 @@ def register():
         db.session.rollback()
         return json_error("Email already registered", 409)
 
-    token = create_jwt_for_user(user)
-
-    return jsonify({
-        "ok": True,
-        "message": "Registered",
-        "api_key": api_key,
-        "token": token,   # NEW (JWT)
-    })
+    token = issue_access_token(user)
+    return jsonify({"ok": True, "message": "Registered", "access_token": token, "api_key": api_key})
 
 
 @app.post("/auth/login")
@@ -504,46 +559,54 @@ def login():
     if not user or not check_password_hash(user.password_hash, password):
         return json_error("Invalid email or password", 401)
 
-    user.last_login_at = datetime.now(timezone.utc)
+    user.last_login_at = now_utc()
     db.session.commit()
 
-    token = create_jwt_for_user(user)
+    token = issue_access_token(user)
+    return jsonify({"ok": True, "access_token": token, "api_key": user.api_key})
 
-    return jsonify({
-        "ok": True,
-        "api_key": user.api_key,  # keep for EA / legacy frontend
-        "token": token,           # NEW (JWT)
-    })
+
+@app.post("/auth/logout-all")
+def logout_all():
+    # user-triggered "force logout" (increments token_version)
+    user, err = require_jwt()
+    if err:
+        return err
+
+    user.token_version = int(user.token_version) + 1
+    db.session.commit()
+    return jsonify({"ok": True})
 
 
 @app.post("/auth/rotate-key")
 @limiter.limit("10 per hour")
-def rotate_key():
-    # allow via JWT or API key
-    user, err = require_user()
+def rotate_key_user():
+    # keep your existing behavior but require JWT instead of password
+    user, err = require_jwt()
     if err:
         return err
 
     user.api_key = secrets.token_hex(24)
     db.session.commit()
-
-    # rotate should also refresh JWT
-    token = create_jwt_for_user(user)
-
-    return jsonify({"ok": True, "api_key": user.api_key, "token": token})
+    return jsonify({"ok": True, "api_key": user.api_key})
 
 
 # -------------------------
 # Routes: Control (EA + Dashboard)
+# Dashboard uses JWT; EA uses X-API-Key
 # -------------------------
 @app.get("/api/v1/status")
 @limiter.limit("120 per minute")
 def status():
-    user, err = require_user()
+    # allow EA (X-API-Key) OR website (JWT)
+    user, err = require_api_key()
     if err:
-        return err
+        user, err2 = require_jwt()
+        if err2:
+            return err  # original "Invalid API key" for EA-like callers
 
     pairs_csv = (user.pairs or user.pair or "XAUUSD").strip() or "XAUUSD"
+    online = ea_connected(user, minutes=5)
 
     return jsonify({
         "ok": True,
@@ -551,7 +614,6 @@ def status():
 
         "pair": first_pair(pairs_csv),
         "pairs": pairs_csv,
-
         "lot_size": float(user.lot_size),
 
         "sl_mode": user.sl_mode,
@@ -566,18 +628,21 @@ def status():
         # billing snapshot
         "plan": user.plan,
         "subscription_status": user.subscription_status,
-        "trial_ends_at": user.trial_ends_at.isoformat() if user.trial_ends_at else None,
+        "trial_ends_at": dt_iso(user.trial_ends_at),
 
-        # EA heartbeat snapshot
-        "ea_connected": ea_connected(user),
-        "last_seen_at": user.last_seen_at.isoformat() if user.last_seen_at else None,
+        # heartbeat snapshot
+        "ea_connected": bool(online),
+        "last_seen_at": dt_iso(user.last_seen_at),
+
+        # optional risk ack
+        "risk_ack_at": dt_iso(user.risk_ack_at),
     })
 
 
 @app.post("/api/v1/toggle")
 @limiter.limit("60 per minute")
 def toggle():
-    user, err = require_user()
+    user, err = require_jwt()
     if err:
         return err
 
@@ -600,7 +665,7 @@ def toggle():
 @app.post("/api/v1/settings")
 @limiter.limit("60 per minute")
 def settings():
-    user, err = require_user()
+    user, err = require_jwt()
     if err:
         return err
 
@@ -610,6 +675,7 @@ def settings():
 
     data = request.get_json(silent=True) or {}
 
+    # accept "pairs" OR "pair"
     if "pairs" in data:
         try:
             user.pairs = normalize_pairs(str(data["pairs"]))
@@ -681,40 +747,41 @@ def settings():
             return json_error("fixed_tp_pips out of range", 400)
         user.fixed_tp_pips = v
 
+    # optional: risk ack
+    if data.get("risk_ack", False):
+        user.risk_ack_at = now_utc()
+
+    user.last_settings_at = now_utc()
     db.session.commit()
     return status()
 
 
 # -------------------------
-# EA Heartbeat (POST from EA)
+# EA Heartbeat (EA calls with X-API-Key)
 # -------------------------
 @app.post("/api/v1/heartbeat")
 @limiter.limit("120 per minute")
 def heartbeat():
-    user, err = require_api_key()  # EA uses X-API-Key
+    user, err = require_api_key()
     if err:
         return err
 
     data = request.get_json(silent=True) or {}
-    symbol = (data.get("symbol") or "").strip().upper()[:32] or None
-    tf = (data.get("tf") or "").strip()[:16] or None
-
-    user.last_seen_at = datetime.now(timezone.utc)
-    user.last_seen_ip = (request.headers.get("CF-Connecting-IP") or request.remote_addr or "")[:64]
-    user.last_seen_symbol = symbol
-    user.last_seen_tf = tf
+    user.last_seen_at = now_utc()
+    user.last_seen_symbol = (data.get("symbol") or "").strip().upper()[:20] or user.last_seen_symbol
+    user.last_seen_tf = (data.get("tf") or "").strip().upper()[:10] or user.last_seen_tf
+    user.last_seen_ip = client_ip()[:64] or user.last_seen_ip
     db.session.commit()
-
     return jsonify({"ok": True})
 
 
 # -------------------------
-# Billing routes (frontend uses JWT or X-API-Key)
+# Billing routes (JWT)
 # -------------------------
 @app.get("/billing/status")
 @limiter.limit("60 per minute")
 def billing_status():
-    user, err = require_user()
+    user, err = require_jwt()
     if err:
         return err
 
@@ -722,7 +789,7 @@ def billing_status():
         "ok": True,
         "plan": user.plan,
         "subscription_status": user.subscription_status,
-        "trial_ends_at": user.trial_ends_at.isoformat() if user.trial_ends_at else None,
+        "trial_ends_at": dt_iso(user.trial_ends_at),
         "trial_active": trial_active(user),
     })
 
@@ -730,7 +797,7 @@ def billing_status():
 @app.post("/billing/create-checkout-session")
 @limiter.limit("20 per hour")
 def create_checkout_session():
-    user, err = require_user()
+    user, err = require_jwt()
     if err:
         return err
 
@@ -743,7 +810,7 @@ def create_checkout_session():
         db.session.commit()
 
     if not user.trial_ends_at:
-        user.trial_ends_at = datetime.now(timezone.utc) + timedelta(days=TRIAL_DAYS)
+        user.trial_ends_at = now_utc() + timedelta(days=TRIAL_DAYS)
         db.session.commit()
 
     success_url = f"{APP_BASE_URL}/billing.html?success=1"
@@ -765,7 +832,7 @@ def create_checkout_session():
 @app.post("/billing/create-portal-session")
 @limiter.limit("30 per hour")
 def create_portal_session():
-    user, err = require_user()
+    user, err = require_jwt()
     if err:
         return err
 
@@ -782,39 +849,6 @@ def create_portal_session():
         return_url=return_url,
     )
     return jsonify({"ok": True, "url": portal.url})
-
-
-# -------------------------
-# Admin routes (example list users) - CORS now works
-# -------------------------
-@app.get("/admin/users")
-@limiter.limit("60 per minute")
-def admin_users():
-    err = require_admin()
-    if err:
-        return err
-
-    q = (request.args.get("q") or "").strip().lower()
-    query = User.query
-    if q:
-        query = query.filter(User.email.ilike(f"%{q}%"))
-
-    rows = query.order_by(User.id.desc()).limit(200).all()
-
-    items = []
-    for u in rows:
-        items.append({
-            "id": u.id,
-            "email": u.email,
-            "plan": u.plan,
-            "subscription_status": u.subscription_status,
-            "enabled": bool(u.enabled),
-            "pairs": u.pairs,
-            "online": ea_connected(u),
-            "last_seen_at": u.last_seen_at.isoformat() if u.last_seen_at else None,
-        })
-
-    return jsonify({"ok": True, "items": items})
 
 
 # -------------------------
@@ -879,12 +913,12 @@ def stripe_webhook():
 
 
 # -------------------------
-# Trades routes
+# Trades routes (EA can post with X-API-Key; website can read with JWT)
 # -------------------------
 @app.post("/api/v1/trades")
 @limiter.limit("120 per minute")
 def post_trade():
-    user, err = require_api_key()  # EA posts trades
+    user, err = require_api_key()
     if err:
         return err
 
@@ -915,7 +949,7 @@ def post_trade():
 @app.get("/api/v1/trades")
 @limiter.limit("60 per minute")
 def get_trades():
-    user, err = require_user()
+    user, err = require_jwt()
     if err:
         return err
 
@@ -943,11 +977,210 @@ def get_trades():
                 "tp": r.tp,
                 "deal_id": r.deal_id,
                 "profit": r.profit,
-                "opened_at": r.opened_at.isoformat(),
+                "opened_at": dt_iso(r.opened_at),
             }
             for r in rows
         ]
     })
+
+
+# -------------------------
+# Admin routes (X-Admin-Token + optional IP lock)
+# -------------------------
+@app.get("/admin/users")
+@limiter.limit("60 per minute")
+def admin_users():
+    ok, err = require_admin()
+    if err:
+        return err
+
+    q = (request.args.get("q") or "").strip().lower()
+    query = User.query
+    if q:
+        query = query.filter(User.email.ilike(f"%{q}%"))
+
+    users = query.order_by(User.id.desc()).limit(200).all()
+
+    return jsonify({
+        "ok": True,
+        "items": [
+            {
+                "id": u.id,
+                "email": u.email,
+                "plan": u.plan,
+                "subscription_status": u.subscription_status,
+                "enabled": bool(u.enabled),
+                "pairs": u.pairs,
+                "lot_size": float(u.lot_size),
+                "last_seen_at": dt_iso(u.last_seen_at),
+                "online": ea_connected(u, minutes=5),
+            }
+            for u in users
+        ]
+    })
+
+
+@app.get("/admin/user/<int:user_id>/activity")
+@limiter.limit("60 per minute")
+def admin_user_activity(user_id: int):
+    ok, err = require_admin()
+    if err:
+        return err
+
+    u = User.query.get(user_id)
+    if not u:
+        return json_error("User not found", 404)
+
+    trades = (
+        Trade.query.filter_by(user_id=u.id)
+        .order_by(Trade.id.desc())
+        .limit(25)
+        .all()
+    )
+
+    return jsonify({
+        "ok": True,
+        "user": {
+            "id": u.id,
+            "email": u.email,
+            "plan": u.plan,
+            "subscription_status": u.subscription_status,
+            "enabled": bool(u.enabled),
+            "pairs": u.pairs,
+            "lot_size": float(u.lot_size),
+            "created_at": dt_iso(u.created_at),
+            "last_login_at": dt_iso(u.last_login_at),
+            "last_settings_at": dt_iso(u.last_settings_at),
+            "last_seen_at": dt_iso(u.last_seen_at),
+            "last_seen_symbol": u.last_seen_symbol,
+            "last_seen_tf": u.last_seen_tf,
+            "last_seen_ip": u.last_seen_ip,
+        },
+        "trades": [
+            {
+                "id": t.id,
+                "symbol": t.symbol,
+                "side": t.side,
+                "volume": t.volume,
+                "entry": t.entry,
+                "sl": t.sl,
+                "tp": t.tp,
+                "deal_id": t.deal_id,
+                "profit": t.profit,
+                "opened_at": dt_iso(t.opened_at),
+            }
+            for t in trades
+        ]
+    })
+
+
+@app.post("/admin/user/<int:user_id>/force-enabled")
+def admin_force_enabled(user_id: int):
+    ok, err = require_admin()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get("enabled", False))
+
+    u = User.query.get(user_id)
+    if not u:
+        return json_error("User not found", 404)
+
+    u.enabled = enabled
+    db.session.commit()
+    return jsonify({"ok": True, "enabled": bool(u.enabled)})
+
+
+@app.post("/admin/user/<int:user_id>/rotate-api-key")
+def admin_rotate_api_key(user_id: int):
+    ok, err = require_admin()
+    if err:
+        return err
+
+    u = User.query.get(user_id)
+    if not u:
+        return json_error("User not found", 404)
+
+    u.api_key = secrets.token_hex(24)
+    db.session.commit()
+    return jsonify({"ok": True, "api_key": u.api_key})
+
+
+@app.post("/admin/user/<int:user_id>/override-billing")
+def admin_override_billing(user_id: int):
+    ok, err = require_admin()
+    if err:
+        return err
+
+    u = User.query.get(user_id)
+    if not u:
+        return json_error("User not found", 404)
+
+    data = request.get_json(silent=True) or {}
+    plan = (data.get("plan") or "").strip().lower()
+    sub = (data.get("subscription_status") or "").strip().lower()
+
+    if plan and plan not in ("free", "pro"):
+        return json_error("plan must be free or pro", 400)
+    if sub and sub not in ("none", "active", "past_due", "canceled"):
+        return json_error("subscription_status invalid", 400)
+
+    if plan:
+        u.plan = plan
+    if sub:
+        u.subscription_status = sub
+
+    if u.subscription_status != "active":
+        u.enabled = False
+
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+@app.post("/admin/user/<int:user_id>/override-settings")
+def admin_override_settings(user_id: int):
+    ok, err = require_admin()
+    if err:
+        return err
+
+    u = User.query.get(user_id)
+    if not u:
+        return json_error("User not found", 404)
+
+    data = request.get_json(silent=True) or {}
+
+    if "pairs" in data:
+        try:
+            u.pairs = normalize_pairs(str(data["pairs"]))
+            u.pair = first_pair(u.pairs)
+        except ValueError as e:
+            return json_error(str(e), 400)
+
+    if "lot_size" in data:
+        lot = safe_float(data["lot_size"])
+        if lot is None or lot <= 0 or lot > 100:
+            return json_error("lot_size out of range", 400)
+        u.lot_size = lot
+
+    u.last_settings_at = now_utc()
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+@app.post("/admin/user/<int:user_id>/force-logout")
+def admin_force_logout(user_id: int):
+    ok, err = require_admin()
+    if err:
+        return err
+
+    u = User.query.get(user_id)
+    if not u:
+        return json_error("User not found", 404)
+
+    u.token_version = int(u.token_version) + 1
+    db.session.commit()
+    return jsonify({"ok": True})
 
 
 # -------------------------
