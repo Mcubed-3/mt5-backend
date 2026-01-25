@@ -4,8 +4,6 @@ import base64
 import hmac
 import hashlib
 import json
-import smtplib
-from email.message import EmailMessage
 from datetime import datetime, timezone, timedelta
 
 from flask import Flask, request, jsonify
@@ -30,7 +28,6 @@ FRONTEND_ORIGINS = [
     "https://www.676trades.org",
 ]
 
-# CORS must allow admin + jwt headers
 CORS(
     app,
     resources={r"/*": {"origins": FRONTEND_ORIGINS}},
@@ -45,17 +42,13 @@ limiter = Limiter(
 )
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///db.sqlite3")
-
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
-# Used by Flask (not JWT)
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", secrets.token_hex(32))
 
 db = SQLAlchemy(app)
@@ -63,8 +56,12 @@ db = SQLAlchemy(app)
 # -------------------------
 # Security / Admin config
 # -------------------------
-JWT_SECRET = os.getenv("JWT_SECRET", "").strip() or os.getenv("SECRET_KEY", "").strip() or app.config["SECRET_KEY"]
-JWT_EXPIRES_MIN = int(os.getenv("JWT_EXPIRES_MIN", "120"))
+JWT_SECRET = (os.getenv("JWT_SECRET", "").strip()
+              or os.getenv("SECRET_KEY", "").strip()
+              or app.config["SECRET_KEY"])
+
+# More user-friendly default (24h). Override in Render env if you want.
+JWT_EXPIRES_MIN = int(os.getenv("JWT_EXPIRES_MIN", "1440"))
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 ADMIN_ALLOWED_IPS = [x.strip() for x in os.getenv("ADMIN_ALLOWED_IPS", "").split(",") if x.strip()]
@@ -73,33 +70,13 @@ ADMIN_ALLOWED_IPS = [x.strip() for x in os.getenv("ADMIN_ALLOWED_IPS", "").split
 # Stripe config
 # -------------------------
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
-STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "").strip()   # must be price_...
+STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "").strip()  # must be price_...
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 APP_BASE_URL = os.getenv("APP_BASE_URL", "https://676trades.org").strip()
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "5"))
 
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
-
-# -------------------------
-# Email (password reset) config (optional)
-# -------------------------
-SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "").strip()
-SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
-SMTP_FROM = os.getenv("SMTP_FROM", "support@676trades.org").strip()
-SUPPORT_EMAIL = os.getenv("SUPPORT_EMAIL", "support@676trades.org").strip()
-
-# -------------------------
-# Supported markets policy
-# -------------------------
-# Public supported markets (beginner-friendly launch set)
-PUBLIC_ALLOWED_PAIRS = {"XAUUSD", "EURUSD", "GBPUSD", "USDJPY"}
-
-# Locked for now (admin testing only)
-ADMIN_TEST_ONLY_PAIRS = {"BTCUSD", "NAS100", "US30"}
-
 
 # -------------------------
 # Models
@@ -112,19 +89,15 @@ class User(db.Model):
     email = db.Column(db.String(255), unique=True, nullable=False, index=True)
     password_hash = db.Column(db.String(255), nullable=False)
 
-    # EA auth
     api_key = db.Column(db.String(64), unique=True, nullable=False, index=True)
 
     enabled = db.Column(db.Boolean, default=False, nullable=False)
 
-    # Backward compatible single symbol
     pair = db.Column(db.String(20), default="XAUUSD", nullable=False)
-    # Multi symbols CSV
     pairs = db.Column(db.String(255), default="XAUUSD", nullable=False)
 
     lot_size = db.Column(db.Float, default=0.01, nullable=False)
 
-    # SL/TP settings
     sl_mode = db.Column(db.String(20), default="dynamic", nullable=False)
     tp_mode = db.Column(db.String(20), default="rr", nullable=False)
 
@@ -137,32 +110,26 @@ class User(db.Model):
     fixed_sl_pips = db.Column(db.Integer, default=50, nullable=False)
     fixed_tp_pips = db.Column(db.Integer, default=50, nullable=False)
 
-    # Billing fields
-    plan = db.Column(db.String(20), default="free", nullable=False)  # free / pro
-    subscription_status = db.Column(db.String(30), default="none", nullable=False)  # none/active/past_due/canceled
+    plan = db.Column(db.String(20), default="free", nullable=False)
+    subscription_status = db.Column(db.String(30), default="none", nullable=False)
     trial_ends_at = db.Column(db.DateTime, nullable=True)
 
     stripe_customer_id = db.Column(db.String(80), nullable=True, index=True)
     stripe_subscription_id = db.Column(db.String(80), nullable=True, index=True)
 
-    # Heartbeat fields
     last_seen_at = db.Column(db.DateTime, nullable=True)
     last_seen_symbol = db.Column(db.String(20), nullable=True)
     last_seen_tf = db.Column(db.String(10), nullable=True)
     last_seen_ip = db.Column(db.String(64), nullable=True)
 
-    # Web/app fields
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     last_login_at = db.Column(db.DateTime, nullable=True)
     last_settings_at = db.Column(db.DateTime, nullable=True)
 
-    # JWT invalidation (force logout)
     token_version = db.Column(db.Integer, default=0, nullable=False)
 
-    # Optional: risk acknowledgement timestamp
     risk_ack_at = db.Column(db.DateTime, nullable=True)
 
-    # Password reset (token stored hashed)
     reset_token_hash = db.Column(db.String(128), nullable=True)
     reset_token_expires_at = db.Column(db.DateTime, nullable=True)
 
@@ -188,13 +155,11 @@ class Trade(db.Model):
 
     opened_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
-
 # -------------------------
 # Helpers
 # -------------------------
 def json_error(message: str, code: int = 400):
     return jsonify({"ok": False, "error": message}), code
-
 
 def safe_float(v, default=None):
     try:
@@ -202,40 +167,26 @@ def safe_float(v, default=None):
     except Exception:
         return default
 
-
 def safe_int(v, default=None):
     try:
         return int(v)
     except Exception:
         return default
 
-
-def normalize_pairs(value: str, allowed_set=None) -> str:
+def normalize_pairs(value: str) -> str:
     parts = [p.strip().upper() for p in (value or "").split(",")]
     parts = [p for p in parts if p]
-
-    if not parts:
-        raise ValueError("pairs cannot be empty")
-
     for p in parts:
         if len(p) < 3 or len(p) > 12:
             raise ValueError("pair looks invalid")
-
-    if allowed_set is not None:
-        for p in parts:
-            if p not in allowed_set:
-                supported = ", ".join(sorted(allowed_set))
-                raise ValueError(f"{p} is not supported yet. Supported: {supported}")
-
-    seen = set()
-    out = []
+    seen, out = set(), []
     for p in parts:
         if p not in seen:
             seen.add(p)
             out.append(p)
-
+    if not out:
+        raise ValueError("pairs cannot be empty")
     return ",".join(out)
-
 
 def first_pair(pairs_csv: str) -> str:
     try:
@@ -243,24 +194,22 @@ def first_pair(pairs_csv: str) -> str:
     except Exception:
         return "XAUUSD"
 
-
 def now_utc():
     return datetime.now(timezone.utc)
-
 
 def dt_iso(dt):
     return dt.isoformat() if dt else None
 
-
 def client_ip():
+    # Cloudflare
     cf = request.headers.get("CF-Connecting-IP", "").strip()
     if cf:
         return cf
+    # Proxies
     xff = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
     if xff:
         return xff
     return request.remote_addr or ""
-
 
 # -------------------------
 # JWT (simple HS256)
@@ -268,11 +217,9 @@ def client_ip():
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode().rstrip("=")
 
-
 def _b64url_decode(s: str) -> bytes:
     pad = "=" * ((4 - len(s) % 4) % 4)
     return base64.urlsafe_b64decode(s + pad)
-
 
 def jwt_encode(payload: dict) -> str:
     header = {"alg": "HS256", "typ": "JWT"}
@@ -281,7 +228,6 @@ def jwt_encode(payload: dict) -> str:
     msg = f"{h}.{p}".encode()
     sig = hmac.new(JWT_SECRET.encode(), msg, hashlib.sha256).digest()
     return f"{h}.{p}.{_b64url(sig)}"
-
 
 def jwt_decode(token: str) -> dict:
     try:
@@ -296,7 +242,6 @@ def jwt_decode(token: str) -> dict:
     except Exception:
         raise ValueError("invalid token")
 
-
 def issue_access_token(user: User) -> str:
     exp = int((now_utc() + timedelta(minutes=JWT_EXPIRES_MIN)).timestamp())
     payload = {
@@ -307,11 +252,11 @@ def issue_access_token(user: User) -> str:
     }
     return jwt_encode(payload)
 
-
 def require_jwt():
     auth = request.headers.get("Authorization", "").strip()
     if not auth.startswith("Bearer "):
         return None, json_error("Missing Authorization Bearer token", 401)
+
     token = auth.split(" ", 1)[1].strip()
     try:
         payload = jwt_decode(token)
@@ -320,7 +265,7 @@ def require_jwt():
 
     exp = payload.get("exp")
     if not exp or int(exp) < int(now_utc().timestamp()):
-        return None, json_error("Token expired", 401)
+        return None, json_error("Token expired. Please login again.", 401)
 
     uid = payload.get("sub")
     if not uid:
@@ -335,7 +280,6 @@ def require_jwt():
 
     return user, None
 
-
 def require_api_key():
     api_key = request.headers.get("X-API-Key", "").strip()
     if not api_key:
@@ -347,7 +291,6 @@ def require_api_key():
 
     return user, None
 
-
 def trial_active(user: User) -> bool:
     if not user.trial_ends_at:
         return False
@@ -356,10 +299,8 @@ def trial_active(user: User) -> bool:
         t = t.replace(tzinfo=timezone.utc)
     return now_utc() < t
 
-
 def is_paid_active(user: User) -> bool:
     return user.subscription_status == "active"
-
 
 def ensure_can_trade(user: User):
     if is_paid_active(user) or trial_active(user):
@@ -369,7 +310,6 @@ def ensure_can_trade(user: User):
         db.session.commit()
     return json_error("Payment required. Please start your free trial / subscribe.", 402)
 
-
 def ea_connected(user: User, minutes=5) -> bool:
     if not user.last_seen_at:
         return False
@@ -377,7 +317,6 @@ def ea_connected(user: User, minutes=5) -> bool:
     if t.tzinfo is None:
         t = t.replace(tzinfo=timezone.utc)
     return now_utc() - t < timedelta(minutes=minutes)
-
 
 # -------------------------
 # Admin auth + IP lock
@@ -390,38 +329,13 @@ def require_admin():
     if token != ADMIN_TOKEN:
         return False, json_error("Unauthorized", 401)
 
+    # Only enforce if you explicitly set ADMIN_ALLOWED_IPS
     if ADMIN_ALLOWED_IPS:
         ip = client_ip()
         if ip not in ADMIN_ALLOWED_IPS:
             return False, json_error("Forbidden (IP not allowed)", 403)
 
     return True, None
-
-
-# -------------------------
-# Email helper (optional)
-# -------------------------
-def send_email(to_email: str, subject: str, body: str) -> bool:
-    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
-        # Not configured -> return False (but routes will still return generic OK)
-        return False
-
-    try:
-        msg = EmailMessage()
-        msg["From"] = SMTP_FROM
-        msg["To"] = to_email
-        msg["Subject"] = subject
-        msg.set_content(body)
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as s:
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASS)
-            s.send_message(msg)
-        return True
-    except Exception as e:
-        print("Email send failed:", str(e))
-        return False
-
 
 # -------------------------
 # Auto-migration (Postgres safe)
@@ -446,7 +360,6 @@ def ensure_schema():
 
         def add_col(sql): conn.execute(text(sql))
 
-        # base
         if "email" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN email VARCHAR(255)')
             add_col('CREATE UNIQUE INDEX IF NOT EXISTS ix_user_email ON "user"(email)')
@@ -470,7 +383,6 @@ def ensure_schema():
         if "last_settings_at" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN last_settings_at TIMESTAMPTZ NULL')
 
-        # sl/tp
         if "sl_mode" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN sl_mode VARCHAR(20) NOT NULL DEFAULT \'dynamic\'')
         if "tp_mode" not in cols:
@@ -488,7 +400,6 @@ def ensure_schema():
         if "fixed_tp_pips" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN fixed_tp_pips INTEGER NOT NULL DEFAULT 50')
 
-        # billing
         if "plan" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN plan VARCHAR(20) NOT NULL DEFAULT \'free\'')
         if "subscription_status" not in cols:
@@ -502,7 +413,6 @@ def ensure_schema():
             add_col('ALTER TABLE "user" ADD COLUMN stripe_subscription_id VARCHAR(80) NULL')
             add_col('CREATE INDEX IF NOT EXISTS ix_user_stripe_subscription_id ON "user"(stripe_subscription_id)')
 
-        # heartbeat
         if "last_seen_at" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN last_seen_at TIMESTAMPTZ NULL')
         if "last_seen_symbol" not in cols:
@@ -512,7 +422,6 @@ def ensure_schema():
         if "last_seen_ip" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN last_seen_ip VARCHAR(64) NULL')
 
-        # jwt invalidation + risk + reset
         if "token_version" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0')
         if "risk_ack_at" not in cols:
@@ -522,7 +431,6 @@ def ensure_schema():
         if "reset_token_expires_at" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN reset_token_expires_at TIMESTAMPTZ NULL')
 
-        # trade table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS trade (
                 id SERIAL PRIMARY KEY,
@@ -541,27 +449,23 @@ def ensure_schema():
         conn.execute(text('CREATE INDEX IF NOT EXISTS ix_trade_user_id ON trade(user_id)'))
         conn.execute(text('CREATE INDEX IF NOT EXISTS ix_trade_deal_id ON trade(deal_id)'))
 
-
 # -------------------------
-# Preflight helper (OPTIONS)
+# Preflight helper
 # -------------------------
 @app.route("/<path:_any>", methods=["OPTIONS"])
 def any_options(_any):
     return ("", 204)
-
 
 # -------------------------
 # Routes: Health
 # -------------------------
 @app.get("/")
 def root():
-    return jsonify({"ok": True, "service": "mt5-control-backend", "version": "v2-jwt-admin-pairlock"})
-
+    return jsonify({"ok": True, "service": "mt5-control-backend", "version": "v2-jwt-admin"})
 
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
-
 
 # -------------------------
 # Routes: Auth (JWT for website)
@@ -601,7 +505,6 @@ def register():
     token = issue_access_token(user)
     return jsonify({"ok": True, "message": "Registered", "access_token": token, "api_key": api_key})
 
-
 @app.post("/auth/login")
 @limiter.limit("30 per hour")
 def login():
@@ -619,17 +522,33 @@ def login():
     token = issue_access_token(user)
     return jsonify({"ok": True, "access_token": token, "api_key": user.api_key})
 
+@app.get("/auth/me")
+def auth_me():
+    user, err = require_jwt()
+    if err:
+        return err
+    return jsonify({
+        "ok": True,
+        "profile": {
+            "id": user.id,
+            "email": user.email,
+            "plan": user.plan,
+            "subscription_status": user.subscription_status,
+            "trial_ends_at": dt_iso(user.trial_ends_at),
+            "created_at": dt_iso(user.created_at),
+            "last_login_at": dt_iso(user.last_login_at),
+            "risk_ack_at": dt_iso(user.risk_ack_at),
+        }
+    })
 
 @app.post("/auth/logout-all")
 def logout_all():
     user, err = require_jwt()
     if err:
         return err
-
     user.token_version = int(user.token_version) + 1
     db.session.commit()
     return jsonify({"ok": True})
-
 
 @app.post("/auth/rotate-key")
 @limiter.limit("10 per hour")
@@ -637,90 +556,31 @@ def rotate_key_user():
     user, err = require_jwt()
     if err:
         return err
-
     user.api_key = secrets.token_hex(24)
     db.session.commit()
     return jsonify({"ok": True, "api_key": user.api_key})
 
-
-# -------------------------
-# Password reset (email optional)
-# -------------------------
-@app.post("/auth/forgot-password")
-@limiter.limit("20 per hour")
-def forgot_password():
-    data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
-
-    # Always return OK (avoid account enumeration)
-    if not email:
-        return jsonify({"ok": True})
-
-    user = User.query.filter_by(email=email).first()
-    if not user:
-        return jsonify({"ok": True})
-
-    raw = secrets.token_urlsafe(32)
-    token_hash = hashlib.sha256(raw.encode()).hexdigest()
-    user.reset_token_hash = token_hash
-    user.reset_token_expires_at = now_utc() + timedelta(minutes=30)
-    db.session.commit()
-
-    reset_link = f"{APP_BASE_URL}/reset.html?token={raw}"
-    body = (
-        "You requested a password reset for 676Trades.\n\n"
-        f"Reset link (valid ~30 minutes):\n{reset_link}\n\n"
-        "If you did not request this, you can ignore this email.\n"
-        f"Support: {SUPPORT_EMAIL}\n"
-    )
-
-    send_email(email, "676Trades - Password reset", body)
-    return jsonify({"ok": True})
-
-
-@app.post("/auth/reset-password")
-@limiter.limit("20 per hour")
-def reset_password():
-    data = request.get_json(silent=True) or {}
-    token = (data.get("token") or "").strip()
-    new_password = (data.get("password") or "").strip()
-
-    if not token or not new_password:
-        return json_error("token and password required", 400)
-
-    token_hash = hashlib.sha256(token.encode()).hexdigest()
-    user = User.query.filter_by(reset_token_hash=token_hash).first()
-    if not user or not user.reset_token_expires_at:
-        return json_error("Invalid or expired token", 400)
-
-    exp = user.reset_token_expires_at
-    if exp.tzinfo is None:
-        exp = exp.replace(tzinfo=timezone.utc)
-    if now_utc() > exp:
-        return json_error("Invalid or expired token", 400)
-
-    user.password_hash = generate_password_hash(new_password)
-    user.reset_token_hash = None
-    user.reset_token_expires_at = None
-    user.token_version = int(user.token_version) + 1  # force logout all sessions
-    db.session.commit()
-
-    return jsonify({"ok": True})
-
-
 # -------------------------
 # Routes: Control (EA + Dashboard)
-# Dashboard uses JWT; EA uses X-API-Key
 # -------------------------
 @app.get("/api/v1/status")
 @limiter.limit("120 per minute")
 def status():
-    # allow EA (X-API-Key) OR website (JWT)
-    user, err = require_api_key()
-    if err:
-        user, err2 = require_jwt()
-        if err2:
-            return err  # keep original error message for EA callers
+    # EA uses X-API-Key; website uses Authorization Bearer
+    user = None
+    err = None
+
+    # If Authorization exists, prefer JWT errors (better UX)
+    has_auth = request.headers.get("Authorization", "").strip().startswith("Bearer ")
+
+    if has_auth:
+        user, err = require_jwt()
+        if err:
+            return err
+    else:
+        user, err = require_api_key()
+        if err:
+            return err
 
     pairs_csv = (user.pairs or user.pair or "XAUUSD").strip() or "XAUUSD"
     online = ea_connected(user, minutes=5)
@@ -728,7 +588,6 @@ def status():
     return jsonify({
         "ok": True,
         "enabled": bool(user.enabled),
-
         "pair": first_pair(pairs_csv),
         "pairs": pairs_csv,
         "lot_size": float(user.lot_size),
@@ -742,19 +601,15 @@ def status():
         "fixed_sl_pips": int(user.fixed_sl_pips),
         "fixed_tp_pips": int(user.fixed_tp_pips),
 
-        # billing snapshot
         "plan": user.plan,
         "subscription_status": user.subscription_status,
         "trial_ends_at": dt_iso(user.trial_ends_at),
 
-        # heartbeat snapshot
         "ea_connected": bool(online),
         "last_seen_at": dt_iso(user.last_seen_at),
 
-        # optional risk ack
         "risk_ack_at": dt_iso(user.risk_ack_at),
     })
-
 
 @app.post("/api/v1/toggle")
 @limiter.limit("60 per minute")
@@ -778,7 +633,6 @@ def toggle():
     db.session.commit()
     return jsonify({"ok": True, "enabled": bool(user.enabled)})
 
-
 @app.post("/api/v1/settings")
 @limiter.limit("60 per minute")
 def settings():
@@ -792,17 +646,16 @@ def settings():
 
     data = request.get_json(silent=True) or {}
 
-    # Enforce public supported markets only
     if "pairs" in data:
         try:
-            user.pairs = normalize_pairs(str(data["pairs"]), allowed_set=PUBLIC_ALLOWED_PAIRS)
+            user.pairs = normalize_pairs(str(data["pairs"]))
             user.pair = first_pair(user.pairs)
         except ValueError as e:
             return json_error(str(e), 400)
 
     if "pair" in data and "pairs" not in data:
         try:
-            single = normalize_pairs(str(data["pair"]), allowed_set=PUBLIC_ALLOWED_PAIRS)
+            single = normalize_pairs(str(data["pair"]))
             user.pairs = single
             user.pair = first_pair(single)
         except ValueError as e:
@@ -816,54 +669,6 @@ def settings():
             return json_error("lot_size out of range", 400)
         user.lot_size = lot
 
-    if "sl_mode" in data:
-        sl_mode = str(data["sl_mode"]).strip().lower()
-        if sl_mode not in ("dynamic", "fixed"):
-            return json_error("sl_mode must be dynamic or fixed", 400)
-        user.sl_mode = sl_mode
-
-    if "tp_mode" in data:
-        tp_mode = str(data["tp_mode"]).strip().lower()
-        if tp_mode not in ("rr", "pattern_mult", "fixed"):
-            return json_error("tp_mode must be rr, pattern_mult, or fixed", 400)
-        user.tp_mode = tp_mode
-
-    if "min_pips" in data:
-        v = safe_int(data["min_pips"])
-        if v is None or v < 1 or v > 5000:
-            return json_error("min_pips out of range", 400)
-        user.min_pips = v
-
-    if "sl_buffer_pips" in data:
-        v = safe_int(data["sl_buffer_pips"])
-        if v is None or v < 0 or v > 500:
-            return json_error("sl_buffer_pips out of range", 400)
-        user.sl_buffer_pips = v
-
-    if "rr" in data:
-        v = safe_float(data["rr"])
-        if v is None or v < 0.1 or v > 20:
-            return json_error("rr out of range", 400)
-        user.rr = v
-
-    if "pattern_tp_mult" in data:
-        v = safe_float(data["pattern_tp_mult"])
-        if v is None or v < 0.1 or v > 20:
-            return json_error("pattern_tp_mult out of range", 400)
-        user.pattern_tp_mult = v
-
-    if "fixed_sl_pips" in data:
-        v = safe_int(data["fixed_sl_pips"])
-        if v is None or v < 1 or v > 5000:
-            return json_error("fixed_sl_pips out of range", 400)
-        user.fixed_sl_pips = v
-
-    if "fixed_tp_pips" in data:
-        v = safe_int(data["fixed_tp_pips"])
-        if v is None or v < 1 or v > 5000:
-            return json_error("fixed_tp_pips out of range", 400)
-        user.fixed_tp_pips = v
-
     if data.get("risk_ack", False):
         user.risk_ack_at = now_utc()
 
@@ -871,9 +676,8 @@ def settings():
     db.session.commit()
     return status()
 
-
 # -------------------------
-# EA Heartbeat (EA calls with X-API-Key)
+# EA Heartbeat
 # -------------------------
 @app.post("/api/v1/heartbeat")
 @limiter.limit("120 per minute")
@@ -889,7 +693,6 @@ def heartbeat():
     user.last_seen_ip = client_ip()[:64] or user.last_seen_ip
     db.session.commit()
     return jsonify({"ok": True})
-
 
 # -------------------------
 # Billing routes (JWT)
@@ -908,7 +711,6 @@ def billing_status():
         "trial_ends_at": dt_iso(user.trial_ends_at),
         "trial_active": trial_active(user),
     })
-
 
 @app.post("/billing/create-checkout-session")
 @limiter.limit("20 per hour")
@@ -944,7 +746,6 @@ def create_checkout_session():
 
     return jsonify({"ok": True, "url": session.url})
 
-
 @app.post("/billing/create-portal-session")
 @limiter.limit("30 per hour")
 def create_portal_session():
@@ -959,17 +760,12 @@ def create_portal_session():
         return json_error("No Stripe customer found for this user.", 400)
 
     return_url = f"{APP_BASE_URL}/billing.html"
-
     portal = stripe.billing_portal.Session.create(
         customer=user.stripe_customer_id,
         return_url=return_url,
     )
     return jsonify({"ok": True, "url": portal.url})
 
-
-# -------------------------
-# Stripe webhook
-# -------------------------
 @app.post("/stripe/webhook")
 def stripe_webhook():
     if not STRIPE_WEBHOOK_SECRET:
@@ -1011,7 +807,6 @@ def stripe_webhook():
         user = get_user_by_customer(customer_id)
         if user:
             user.stripe_subscription_id = subscription_id
-
             if status in ("active", "trialing"):
                 user.subscription_status = "active"
                 user.plan = "pro"
@@ -1022,14 +817,12 @@ def stripe_webhook():
                 user.subscription_status = "canceled"
                 user.plan = "free"
                 user.enabled = False
-
             db.session.commit()
 
     return jsonify({"ok": True})
 
-
 # -------------------------
-# Trades routes (EA can post with X-API-Key; website can read with JWT)
+# Trades routes
 # -------------------------
 @app.post("/api/v1/trades")
 @limiter.limit("120 per minute")
@@ -1058,9 +851,7 @@ def post_trade():
     )
     db.session.add(t)
     db.session.commit()
-
     return jsonify({"ok": True, "id": t.id})
-
 
 @app.get("/api/v1/trades")
 @limiter.limit("60 per minute")
@@ -1099,9 +890,8 @@ def get_trades():
         ]
     })
 
-
 # -------------------------
-# Admin routes (X-Admin-Token + optional IP lock)
+# Admin routes
 # -------------------------
 @app.get("/admin/users")
 @limiter.limit("60 per minute")
@@ -1134,7 +924,6 @@ def admin_users():
             for u in users
         ]
     })
-
 
 @app.get("/admin/user/<int:user_id>/activity")
 @limiter.limit("60 per minute")
@@ -1189,7 +978,6 @@ def admin_user_activity(user_id: int):
         ]
     })
 
-
 @app.post("/admin/user/<int:user_id>/force-enabled")
 def admin_force_enabled(user_id: int):
     ok, err = require_admin()
@@ -1207,7 +995,6 @@ def admin_force_enabled(user_id: int):
     db.session.commit()
     return jsonify({"ok": True, "enabled": bool(u.enabled)})
 
-
 @app.post("/admin/user/<int:user_id>/rotate-api-key")
 def admin_rotate_api_key(user_id: int):
     ok, err = require_admin()
@@ -1221,7 +1008,6 @@ def admin_rotate_api_key(user_id: int):
     u.api_key = secrets.token_hex(24)
     db.session.commit()
     return jsonify({"ok": True, "api_key": u.api_key})
-
 
 @app.post("/admin/user/<int:user_id>/override-billing")
 def admin_override_billing(user_id: int):
@@ -1253,7 +1039,6 @@ def admin_override_billing(user_id: int):
     db.session.commit()
     return jsonify({"ok": True})
 
-
 @app.post("/admin/user/<int:user_id>/override-settings")
 def admin_override_settings(user_id: int):
     ok, err = require_admin()
@@ -1266,12 +1051,9 @@ def admin_override_settings(user_id: int):
 
     data = request.get_json(silent=True) or {}
 
-    # Admin can set public + test-only pairs
-    admin_allowed = PUBLIC_ALLOWED_PAIRS | ADMIN_TEST_ONLY_PAIRS
-
     if "pairs" in data:
         try:
-            u.pairs = normalize_pairs(str(data["pairs"]), allowed_set=admin_allowed)
+            u.pairs = normalize_pairs(str(data["pairs"]))
             u.pair = first_pair(u.pairs)
         except ValueError as e:
             return json_error(str(e), 400)
@@ -1285,7 +1067,6 @@ def admin_override_settings(user_id: int):
     u.last_settings_at = now_utc()
     db.session.commit()
     return jsonify({"ok": True})
-
 
 @app.post("/admin/user/<int:user_id>/force-logout")
 def admin_force_logout(user_id: int):
@@ -1301,7 +1082,6 @@ def admin_force_logout(user_id: int):
     db.session.commit()
     return jsonify({"ok": True})
 
-
 # -------------------------
 # Security headers
 # -------------------------
@@ -1313,16 +1093,8 @@ def add_security_headers(resp):
     resp.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
     return resp
 
-
-# -------------------------
-# Ensure schema exists
-# -------------------------
 with app.app_context():
     ensure_schema()
 
-
-# -------------------------
-# Local run
-# -------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
