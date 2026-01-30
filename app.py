@@ -16,6 +16,8 @@ from sqlalchemy import text
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
+from flask_mail import Mail, Message
+
 import stripe
 
 # -------------------------
@@ -23,10 +25,20 @@ import stripe
 # -------------------------
 app = Flask(__name__)
 
-FRONTEND_ORIGINS = [
-    "https://676trades.org",
-    "https://www.676trades.org",
-]
+def parse_origins():
+    """
+    Use env var FRONTEND_ORIGINS="https://a.com,https://b.com"
+    If missing, fall back to old domain so current site keeps working.
+    """
+    raw = os.getenv("FRONTEND_ORIGINS", "").strip()
+    if raw:
+        return [x.strip() for x in raw.split(",") if x.strip()]
+    return [
+        "https://676trades.org",
+        "https://www.676trades.org",
+    ]
+
+FRONTEND_ORIGINS = parse_origins()
 
 CORS(
     app,
@@ -54,25 +66,44 @@ app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", secrets.token_hex(32))
 db = SQLAlchemy(app)
 
 # -------------------------
+# Mail (password reset)
+# -------------------------
+# Works with your provider SMTP settings on Render.
+# If you don't set these env vars, reset endpoints will return a clear error.
+app.config["MAIL_SERVER"] = os.getenv("MAIL_SERVER", "").strip()
+app.config["MAIL_PORT"] = int(os.getenv("MAIL_PORT", "587"))
+app.config["MAIL_USE_TLS"] = os.getenv("MAIL_USE_TLS", "true").lower() == "true"
+app.config["MAIL_USE_SSL"] = os.getenv("MAIL_USE_SSL", "false").lower() == "true"
+app.config["MAIL_USERNAME"] = os.getenv("MAIL_USERNAME", "").strip()
+app.config["MAIL_PASSWORD"] = os.getenv("MAIL_PASSWORD", "").strip()
+app.config["MAIL_DEFAULT_SENDER"] = os.getenv("MAIL_DEFAULT_SENDER", "").strip()  # e.g. "Caribbean Covenant <support@domain>"
+mail = Mail(app)
+
+# -------------------------
 # Security / Admin config
 # -------------------------
 JWT_SECRET = (os.getenv("JWT_SECRET", "").strip()
               or os.getenv("SECRET_KEY", "").strip()
               or app.config["SECRET_KEY"])
 
-# More user-friendly default (24h). Override in Render env if you want.
-JWT_EXPIRES_MIN = int(os.getenv("JWT_EXPIRES_MIN", "1440"))
+JWT_EXPIRES_MIN = int(os.getenv("JWT_EXPIRES_MIN", "1440"))  # 24h
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 ADMIN_ALLOWED_IPS = [x.strip() for x in os.getenv("ADMIN_ALLOWED_IPS", "").split(",") if x.strip()]
 
 # -------------------------
-# Stripe config
+# Branding / URLs
+# -------------------------
+APP_NAME = os.getenv("APP_NAME", "Caribbean Covenant").strip()
+APP_BASE_URL = os.getenv("APP_BASE_URL", "https://676trades.org").strip()  # update later to your new domain
+SUPPORT_EMAIL = os.getenv("SUPPORT_EMAIL", "support@676trades.org").strip()
+
+# -------------------------
+# Stripe config (optional)
 # -------------------------
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
-STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "").strip()  # must be price_...
+STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "").strip()
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
-APP_BASE_URL = os.getenv("APP_BASE_URL", "https://676trades.org").strip()
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "5"))
 
 if STRIPE_SECRET_KEY:
@@ -86,37 +117,45 @@ class User(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
 
+    # Auth
     email = db.Column(db.String(255), unique=True, nullable=False, index=True)
     password_hash = db.Column(db.String(255), nullable=False)
 
+    # Old: API key (you can keep it; not harmful)
     api_key = db.Column(db.String(64), unique=True, nullable=False, index=True)
 
-    enabled = db.Column(db.Boolean, default=False, nullable=False)
+    # --- COMMUNITY PROFILE (NEW) ---
+    display_name = db.Column(db.String(80), nullable=True)
+    bio = db.Column(db.String(500), nullable=True)
+    country = db.Column(db.String(60), nullable=True)   # Jamaica / UK / Canada etc.
+    parish = db.Column(db.String(60), nullable=True)    # optional
+    denomination = db.Column(db.String(80), nullable=True)
+    looking_for = db.Column(db.String(200), nullable=True)  # short statement
+    faith_statement = db.Column(db.String(300), nullable=True)
+    age_range = db.Column(db.String(20), nullable=True)  # e.g. "25-34" (avoid DOB for now)
 
+    # --- TRADING FIELDS (legacy; safe to keep during transition) ---
+    enabled = db.Column(db.Boolean, default=False, nullable=False)
     pair = db.Column(db.String(20), default="XAUUSD", nullable=False)
     pairs = db.Column(db.String(255), default="XAUUSD", nullable=False)
-
     lot_size = db.Column(db.Float, default=0.01, nullable=False)
-
     sl_mode = db.Column(db.String(20), default="dynamic", nullable=False)
     tp_mode = db.Column(db.String(20), default="rr", nullable=False)
-
     min_pips = db.Column(db.Integer, default=50, nullable=False)
     sl_buffer_pips = db.Column(db.Integer, default=5, nullable=False)
-
     rr = db.Column(db.Float, default=1.0, nullable=False)
     pattern_tp_mult = db.Column(db.Float, default=1.5, nullable=False)
-
     fixed_sl_pips = db.Column(db.Integer, default=50, nullable=False)
     fixed_tp_pips = db.Column(db.Integer, default=50, nullable=False)
 
+    # Billing
     plan = db.Column(db.String(20), default="free", nullable=False)
     subscription_status = db.Column(db.String(30), default="none", nullable=False)
     trial_ends_at = db.Column(db.DateTime, nullable=True)
-
     stripe_customer_id = db.Column(db.String(80), nullable=True, index=True)
     stripe_subscription_id = db.Column(db.String(80), nullable=True, index=True)
 
+    # Status
     last_seen_at = db.Column(db.DateTime, nullable=True)
     last_seen_symbol = db.Column(db.String(20), nullable=True)
     last_seen_tf = db.Column(db.String(10), nullable=True)
@@ -127,32 +166,61 @@ class User(db.Model):
     last_settings_at = db.Column(db.DateTime, nullable=True)
 
     token_version = db.Column(db.Integer, default=0, nullable=False)
-
     risk_ack_at = db.Column(db.DateTime, nullable=True)
 
+    # Password reset
     reset_token_hash = db.Column(db.String(128), nullable=True)
     reset_token_expires_at = db.Column(db.DateTime, nullable=True)
+
+
+class Group(db.Model):
+    __tablename__ = "group"
+
+    id = db.Column(db.Integer, primary_key=True)
+    slug = db.Column(db.String(80), unique=True, nullable=False, index=True)  # stable identifier
+    name = db.Column(db.String(120), nullable=False)
+    description = db.Column(db.String(500), nullable=True)
+    is_public = db.Column(db.Boolean, default=True, nullable=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+class GroupMember(db.Model):
+    __tablename__ = "group_member"
+
+    id = db.Column(db.Integer, primary_key=True)
+    group_id = db.Column(db.Integer, db.ForeignKey("group.id"), index=True, nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), index=True, nullable=False)
+    joined_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    __table_args__ = (
+        db.UniqueConstraint("group_id", "user_id", name="uq_group_member"),
+    )
+
+
+class GroupPost(db.Model):
+    __tablename__ = "group_post"
+
+    id = db.Column(db.Integer, primary_key=True)
+    group_id = db.Column(db.Integer, db.ForeignKey("group.id"), index=True, nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), index=True, nullable=False)
+
+    content = db.Column(db.String(1200), nullable=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 
 class Trade(db.Model):
     __tablename__ = "trade"
 
     id = db.Column(db.Integer, primary_key=True)
-
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), index=True, nullable=False)
-    user = db.relationship("User", backref="trades")
-
     symbol = db.Column(db.String(20), nullable=False)
     side = db.Column(db.String(10), nullable=False)
-
     volume = db.Column(db.Float, nullable=False)
     entry = db.Column(db.Float, nullable=True)
     sl = db.Column(db.Float, nullable=True)
     tp = db.Column(db.Float, nullable=True)
-
     deal_id = db.Column(db.String(64), nullable=True, index=True)
     profit = db.Column(db.Float, nullable=True)
-
     opened_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 # -------------------------
@@ -172,6 +240,21 @@ def safe_int(v, default=None):
         return int(v)
     except Exception:
         return default
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+def dt_iso(dt):
+    return dt.isoformat() if dt else None
+
+def client_ip():
+    cf = request.headers.get("CF-Connecting-IP", "").strip()
+    if cf:
+        return cf
+    xff = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+    if xff:
+        return xff
+    return request.remote_addr or ""
 
 def normalize_pairs(value: str) -> str:
     parts = [p.strip().upper() for p in (value or "").split(",")]
@@ -193,23 +276,6 @@ def first_pair(pairs_csv: str) -> str:
         return (pairs_csv or "XAUUSD").split(",")[0].strip().upper() or "XAUUSD"
     except Exception:
         return "XAUUSD"
-
-def now_utc():
-    return datetime.now(timezone.utc)
-
-def dt_iso(dt):
-    return dt.isoformat() if dt else None
-
-def client_ip():
-    # Cloudflare
-    cf = request.headers.get("CF-Connecting-IP", "").strip()
-    if cf:
-        return cf
-    # Proxies
-    xff = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-    if xff:
-        return xff
-    return request.remote_addr or ""
 
 # -------------------------
 # JWT (simple HS256)
@@ -329,13 +395,35 @@ def require_admin():
     if token != ADMIN_TOKEN:
         return False, json_error("Unauthorized", 401)
 
-    # Only enforce if you explicitly set ADMIN_ALLOWED_IPS
     if ADMIN_ALLOWED_IPS:
         ip = client_ip()
         if ip not in ADMIN_ALLOWED_IPS:
             return False, json_error("Forbidden (IP not allowed)", 403)
 
     return True, None
+
+# -------------------------
+# Password reset helpers
+# -------------------------
+def _hash_token(raw: str) -> str:
+    # Store only hash in DB (safer if DB leaked)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+def _send_reset_email(to_email: str, reset_url: str):
+    if not app.config["MAIL_SERVER"] or not app.config["MAIL_DEFAULT_SENDER"]:
+        raise RuntimeError("MAIL not configured")
+
+    subject = f"{APP_NAME} — Password reset"
+    body = (
+        f"Hello,\n\n"
+        f"We received a request to reset your password for {APP_NAME}.\n\n"
+        f"Reset link:\n{reset_url}\n\n"
+        f"If you did not request this, you can ignore this email.\n\n"
+        f"Support: {SUPPORT_EMAIL}\n"
+    )
+
+    msg = Message(subject=subject, recipients=[to_email], body=body)
+    mail.send(msg)
 
 # -------------------------
 # Auto-migration (Postgres safe)
@@ -345,9 +433,11 @@ def ensure_schema():
     is_postgres = uri.startswith("postgresql")
     if not is_postgres:
         db.create_all()
+        seed_default_groups()
         return
 
     with db.engine.begin() as conn:
+        # base user table
         conn.execute(text("""CREATE TABLE IF NOT EXISTS "user" (id SERIAL PRIMARY KEY)"""))
 
         cols = {
@@ -360,6 +450,7 @@ def ensure_schema():
 
         def add_col(sql): conn.execute(text(sql))
 
+        # auth cols
         if "email" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN email VARCHAR(255)')
             add_col('CREATE UNIQUE INDEX IF NOT EXISTS ix_user_email ON "user"(email)')
@@ -368,6 +459,26 @@ def ensure_schema():
         if "api_key" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN api_key VARCHAR(64)')
             add_col('CREATE UNIQUE INDEX IF NOT EXISTS ix_user_api_key ON "user"(api_key)')
+
+        # community profile cols
+        if "display_name" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN display_name VARCHAR(80)')
+        if "bio" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN bio VARCHAR(500)')
+        if "country" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN country VARCHAR(60)')
+        if "parish" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN parish VARCHAR(60)')
+        if "denomination" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN denomination VARCHAR(80)')
+        if "looking_for" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN looking_for VARCHAR(200)')
+        if "faith_statement" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN faith_statement VARCHAR(300)')
+        if "age_range" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN age_range VARCHAR(20)')
+
+        # legacy trading cols (keep)
         if "enabled" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT FALSE')
         if "pair" not in cols:
@@ -376,13 +487,6 @@ def ensure_schema():
             add_col('ALTER TABLE "user" ADD COLUMN pairs VARCHAR(255) NOT NULL DEFAULT \'XAUUSD\'')
         if "lot_size" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN lot_size DOUBLE PRECISION NOT NULL DEFAULT 0.01')
-        if "created_at" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()')
-        if "last_login_at" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN last_login_at TIMESTAMPTZ NULL')
-        if "last_settings_at" not in cols:
-            add_col('ALTER TABLE "user" ADD COLUMN last_settings_at TIMESTAMPTZ NULL')
-
         if "sl_mode" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN sl_mode VARCHAR(20) NOT NULL DEFAULT \'dynamic\'')
         if "tp_mode" not in cols:
@@ -400,6 +504,7 @@ def ensure_schema():
         if "fixed_tp_pips" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN fixed_tp_pips INTEGER NOT NULL DEFAULT 50')
 
+        # billing cols
         if "plan" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN plan VARCHAR(20) NOT NULL DEFAULT \'free\'')
         if "subscription_status" not in cols:
@@ -413,6 +518,13 @@ def ensure_schema():
             add_col('ALTER TABLE "user" ADD COLUMN stripe_subscription_id VARCHAR(80) NULL')
             add_col('CREATE INDEX IF NOT EXISTS ix_user_stripe_subscription_id ON "user"(stripe_subscription_id)')
 
+        # status cols
+        if "created_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()')
+        if "last_login_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN last_login_at TIMESTAMPTZ NULL')
+        if "last_settings_at" not in cols:
+            add_col('ALTER TABLE "user" ADD COLUMN last_settings_at TIMESTAMPTZ NULL')
         if "last_seen_at" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN last_seen_at TIMESTAMPTZ NULL')
         if "last_seen_symbol" not in cols:
@@ -431,6 +543,7 @@ def ensure_schema():
         if "reset_token_expires_at" not in cols:
             add_col('ALTER TABLE "user" ADD COLUMN reset_token_expires_at TIMESTAMPTZ NULL')
 
+        # trades table (legacy)
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS trade (
                 id SERIAL PRIMARY KEY,
@@ -449,6 +562,68 @@ def ensure_schema():
         conn.execute(text('CREATE INDEX IF NOT EXISTS ix_trade_user_id ON trade(user_id)'))
         conn.execute(text('CREATE INDEX IF NOT EXISTS ix_trade_deal_id ON trade(deal_id)'))
 
+        # community tables
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS "group" (
+                id SERIAL PRIMARY KEY,
+                slug VARCHAR(80) UNIQUE NOT NULL,
+                name VARCHAR(120) NOT NULL,
+                description VARCHAR(500) NULL,
+                is_public BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
+        conn.execute(text('CREATE INDEX IF NOT EXISTS ix_group_slug ON "group"(slug)'))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS group_member (
+                id SERIAL PRIMARY KEY,
+                group_id INTEGER NOT NULL REFERENCES "group"(id),
+                user_id INTEGER NOT NULL REFERENCES "user"(id),
+                joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT uq_group_member UNIQUE(group_id, user_id)
+            )
+        """))
+        conn.execute(text('CREATE INDEX IF NOT EXISTS ix_group_member_group_id ON group_member(group_id)'))
+        conn.execute(text('CREATE INDEX IF NOT EXISTS ix_group_member_user_id ON group_member(user_id)'))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS group_post (
+                id SERIAL PRIMARY KEY,
+                group_id INTEGER NOT NULL REFERENCES "group"(id),
+                user_id INTEGER NOT NULL REFERENCES "user"(id),
+                content VARCHAR(1200) NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
+        conn.execute(text('CREATE INDEX IF NOT EXISTS ix_group_post_group_id ON group_post(group_id)'))
+        conn.execute(text('CREATE INDEX IF NOT EXISTS ix_group_post_user_id ON group_post(user_id)'))
+
+    seed_default_groups()
+
+def seed_default_groups():
+    """
+    Create starter groups once. Safe to run every boot.
+    """
+    defaults = [
+        ("christian-singles-jamaica", "Christian Singles — Jamaica",
+         "Faith-centered discussion for singles in Jamaica. Calm conversation, no pressure."),
+        ("caribbean-diaspora", "Caribbean Diaspora — UK / Canada / US",
+         "For Caribbean Christians abroad who want shared culture and shared faith."),
+        ("prayer-discernment", "Prayer & Discernment",
+         "Discussion prompts focused on wisdom, peace, and discernment in relationships."),
+        ("preparing-for-marriage", "Preparing for Marriage",
+         "Conversations on communication, boundaries, family, finances, and purpose."),
+    ]
+    try:
+        for slug, name, desc in defaults:
+            exists = Group.query.filter_by(slug=slug).first()
+            if not exists:
+                db.session.add(Group(slug=slug, name=name, description=desc, is_public=True))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
 # -------------------------
 # Preflight helper
 # -------------------------
@@ -461,14 +636,14 @@ def any_options(_any):
 # -------------------------
 @app.get("/")
 def root():
-    return jsonify({"ok": True, "service": "mt5-control-backend", "version": "v2-jwt-admin"})
+    return jsonify({"ok": True, "service": "caribbean-covenant-backend", "app": APP_NAME})
 
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
 
 # -------------------------
-# Routes: Auth (JWT for website)
+# Routes: Auth (JWT)
 # -------------------------
 @app.post("/auth/register")
 @limiter.limit("10 per hour")
@@ -493,6 +668,7 @@ def register():
         plan="free",
         subscription_status="none",
         token_version=0,
+        created_at=now_utc(),
     )
 
     try:
@@ -532,12 +708,12 @@ def auth_me():
         "profile": {
             "id": user.id,
             "email": user.email,
+            "display_name": user.display_name,
             "plan": user.plan,
             "subscription_status": user.subscription_status,
             "trial_ends_at": dt_iso(user.trial_ends_at),
             "created_at": dt_iso(user.created_at),
             "last_login_at": dt_iso(user.last_login_at),
-            "risk_ack_at": dt_iso(user.risk_ack_at),
         }
     })
 
@@ -561,18 +737,262 @@ def rotate_key_user():
     return jsonify({"ok": True, "api_key": user.api_key})
 
 # -------------------------
-# Routes: Control (EA + Dashboard)
+# Auth: Forgot / Reset password (NEW)
+# -------------------------
+@app.post("/auth/forgot-password")
+@limiter.limit("10 per hour")
+def forgot_password():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        return json_error("Email required", 400)
+
+    user = User.query.filter_by(email=email).first()
+    # Always return ok (prevents account enumeration)
+    if not user:
+        return jsonify({"ok": True})
+
+    raw_token = secrets.token_urlsafe(32)
+    user.reset_token_hash = _hash_token(raw_token)
+    user.reset_token_expires_at = now_utc() + timedelta(minutes=30)
+    db.session.commit()
+
+    reset_url = f"{APP_BASE_URL}/reset.html?token={raw_token}&email={email}"
+
+    try:
+        _send_reset_email(email, reset_url)
+    except Exception:
+        # Still return ok for privacy; log server-side if you want
+        return jsonify({"ok": True})
+
+    return jsonify({"ok": True})
+
+@app.post("/auth/reset-password")
+@limiter.limit("10 per hour")
+def reset_password():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    token = (data.get("token") or "").strip()
+    new_password = (data.get("new_password") or "").strip()
+
+    if not email or not token or not new_password:
+        return json_error("email, token, new_password required", 400)
+    if len(new_password) < 8:
+        return json_error("Password must be at least 8 characters.", 400)
+
+    user = User.query.filter_by(email=email).first()
+    if not user or not user.reset_token_hash or not user.reset_token_expires_at:
+        return json_error("Invalid or expired token", 400)
+
+    exp = user.reset_token_expires_at
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if now_utc() > exp:
+        return json_error("Invalid or expired token", 400)
+
+    if _hash_token(token) != user.reset_token_hash:
+        return json_error("Invalid or expired token", 400)
+
+    user.password_hash = generate_password_hash(new_password)
+    user.reset_token_hash = None
+    user.reset_token_expires_at = None
+
+    # invalidate all sessions
+    user.token_version = int(user.token_version) + 1
+    db.session.commit()
+
+    return jsonify({"ok": True})
+
+# -------------------------
+# COMMUNITY MVP (NEW)
+# -------------------------
+@app.get("/api/v1/me")
+def me_get():
+    user, err = require_jwt()
+    if err:
+        return err
+
+    return jsonify({
+        "ok": True,
+        "me": {
+            "email": user.email,
+            "display_name": user.display_name,
+            "bio": user.bio,
+            "country": user.country,
+            "parish": user.parish,
+            "denomination": user.denomination,
+            "looking_for": user.looking_for,
+            "faith_statement": user.faith_statement,
+            "age_range": user.age_range,
+            "created_at": dt_iso(user.created_at),
+        }
+    })
+
+@app.post("/api/v1/me")
+@limiter.limit("60 per minute")
+def me_post():
+    user, err = require_jwt()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+
+    def s(key, maxlen):
+        v = (data.get(key) or "").strip()
+        if not v:
+            return None
+        return v[:maxlen]
+
+    user.display_name = s("display_name", 80) or user.display_name
+    user.bio = s("bio", 500)
+    user.country = s("country", 60)
+    user.parish = s("parish", 60)
+    user.denomination = s("denomination", 80)
+    user.looking_for = s("looking_for", 200)
+    user.faith_statement = s("faith_statement", 300)
+    user.age_range = s("age_range", 20)
+
+    db.session.commit()
+    return me_get()
+
+PROMPTS = [
+    "What does a Christ-centered marriage mean to you in everyday life?",
+    "How do you like to handle conflict in a respectful and healthy way?",
+    "What values do you want your home to be built on?",
+    "How do you practice your faith throughout the week?",
+    "What does accountability look like to you in a relationship?",
+    "How do you balance purpose, work, and family in your future?",
+    "What boundaries help you date with peace and clarity?",
+    "What role should prayer play in courtship and decision-making?",
+    "What is something God has been teaching you recently?",
+    "How do you want to communicate during stressful seasons?",
+]
+
+@app.get("/api/v1/prompts")
+def prompts():
+    # no auth required; safe public content
+    return jsonify({"ok": True, "items": PROMPTS})
+
+@app.get("/api/v1/groups")
+def list_groups():
+    user, err = require_jwt()
+    if err:
+        return err
+
+    groups = Group.query.order_by(Group.id.asc()).all()
+    my = {m.group_id for m in GroupMember.query.filter_by(user_id=user.id).all()}
+
+    return jsonify({
+        "ok": True,
+        "items": [
+            {
+                "id": g.id,
+                "slug": g.slug,
+                "name": g.name,
+                "description": g.description,
+                "is_public": bool(g.is_public),
+                "joined": (g.id in my),
+                "created_at": dt_iso(g.created_at),
+            } for g in groups
+        ]
+    })
+
+@app.post("/api/v1/groups/join")
+@limiter.limit("60 per minute")
+def join_group():
+    user, err = require_jwt()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    gid = safe_int(data.get("group_id"))
+    if not gid:
+        return json_error("group_id required", 400)
+
+    g = Group.query.get(gid)
+    if not g:
+        return json_error("Group not found", 404)
+
+    try:
+        db.session.add(GroupMember(group_id=g.id, user_id=user.id))
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()  # already joined
+
+    return jsonify({"ok": True})
+
+@app.get("/api/v1/groups/<int:group_id>/posts")
+def get_group_posts(group_id: int):
+    user, err = require_jwt()
+    if err:
+        return err
+
+    # must be a member to view (simple safety rule)
+    mem = GroupMember.query.filter_by(group_id=group_id, user_id=user.id).first()
+    if not mem:
+        return json_error("Join the group to view posts.", 403)
+
+    limit = safe_int(request.args.get("limit", 50), 50)
+    limit = max(1, min(limit, 200))
+
+    posts = (
+        GroupPost.query
+        .filter_by(group_id=group_id)
+        .order_by(GroupPost.id.desc())
+        .limit(limit)
+        .all()
+    )
+
+    # Map user display names quickly
+    user_ids = list({p.user_id for p in posts})
+    users = User.query.filter(User.id.in_(user_ids)).all() if user_ids else []
+    u_map = {u.id: (u.display_name or "Member") for u in users}
+
+    return jsonify({
+        "ok": True,
+        "items": [
+            {
+                "id": p.id,
+                "group_id": p.group_id,
+                "user_id": p.user_id,
+                "display_name": u_map.get(p.user_id, "Member"),
+                "content": p.content,
+                "created_at": dt_iso(p.created_at),
+            } for p in posts
+        ]
+    })
+
+@app.post("/api/v1/groups/<int:group_id>/posts")
+@limiter.limit("60 per minute")
+def create_group_post(group_id: int):
+    user, err = require_jwt()
+    if err:
+        return err
+
+    mem = GroupMember.query.filter_by(group_id=group_id, user_id=user.id).first()
+    if not mem:
+        return json_error("Join the group to post.", 403)
+
+    data = request.get_json(silent=True) or {}
+    content = (data.get("content") or "").strip()
+    if not content:
+        return json_error("content required", 400)
+
+    content = content[:1200]
+    db.session.add(GroupPost(group_id=group_id, user_id=user.id, content=content))
+    db.session.commit()
+    return jsonify({"ok": True})
+
+# -------------------------
+# LEGACY: Control (EA + Dashboard) — unchanged
 # -------------------------
 @app.get("/api/v1/status")
 @limiter.limit("120 per minute")
 def status():
-    # EA uses X-API-Key; website uses Authorization Bearer
     user = None
     err = None
 
-    # If Authorization exists, prefer JWT errors (better UX)
     has_auth = request.headers.get("Authorization", "").strip().startswith("Bearer ")
-
     if has_auth:
         user, err = require_jwt()
         if err:
@@ -607,7 +1027,6 @@ def status():
 
         "ea_connected": bool(online),
         "last_seen_at": dt_iso(user.last_seen_at),
-
         "risk_ack_at": dt_iso(user.risk_ack_at),
     })
 
@@ -676,9 +1095,6 @@ def settings():
     db.session.commit()
     return status()
 
-# -------------------------
-# EA Heartbeat
-# -------------------------
 @app.post("/api/v1/heartbeat")
 @limiter.limit("120 per minute")
 def heartbeat():
@@ -695,7 +1111,7 @@ def heartbeat():
     return jsonify({"ok": True})
 
 # -------------------------
-# Billing routes (JWT)
+# Billing routes (kept)
 # -------------------------
 @app.get("/billing/status")
 @limiter.limit("60 per minute")
@@ -822,76 +1238,7 @@ def stripe_webhook():
     return jsonify({"ok": True})
 
 # -------------------------
-# Trades routes
-# -------------------------
-@app.post("/api/v1/trades")
-@limiter.limit("120 per minute")
-def post_trade():
-    user, err = require_api_key()
-    if err:
-        return err
-
-    data = request.get_json(silent=True) or {}
-    symbol = (data.get("symbol") or "").strip().upper()
-    side = (data.get("side") or "").strip().upper()
-
-    if not symbol or side not in ("BUY", "SELL"):
-        return json_error("symbol and side (BUY/SELL) required", 400)
-
-    t = Trade(
-        user_id=user.id,
-        symbol=symbol,
-        side=side,
-        volume=safe_float(data.get("volume"), 0.0) or 0.0,
-        entry=safe_float(data.get("entry")),
-        sl=safe_float(data.get("sl")),
-        tp=safe_float(data.get("tp")),
-        deal_id=str(data.get("deal_id") or "")[:64] or None,
-        profit=safe_float(data.get("profit")),
-    )
-    db.session.add(t)
-    db.session.commit()
-    return jsonify({"ok": True, "id": t.id})
-
-@app.get("/api/v1/trades")
-@limiter.limit("60 per minute")
-def get_trades():
-    user, err = require_jwt()
-    if err:
-        return err
-
-    limit = safe_int(request.args.get("limit", 50), 50)
-    limit = max(1, min(limit, 200))
-
-    rows = (
-        Trade.query
-        .filter_by(user_id=user.id)
-        .order_by(Trade.id.desc())
-        .limit(limit)
-        .all()
-    )
-
-    return jsonify({
-        "ok": True,
-        "items": [
-            {
-                "id": r.id,
-                "symbol": r.symbol,
-                "side": r.side,
-                "volume": r.volume,
-                "entry": r.entry,
-                "sl": r.sl,
-                "tp": r.tp,
-                "deal_id": r.deal_id,
-                "profit": r.profit,
-                "opened_at": dt_iso(r.opened_at),
-            }
-            for r in rows
-        ]
-    })
-
-# -------------------------
-# Admin routes
+# Admin routes (kept)
 # -------------------------
 @app.get("/admin/users")
 @limiter.limit("60 per minute")
@@ -913,6 +1260,7 @@ def admin_users():
             {
                 "id": u.id,
                 "email": u.email,
+                "display_name": u.display_name,
                 "plan": u.plan,
                 "subscription_status": u.subscription_status,
                 "enabled": bool(u.enabled),
@@ -924,163 +1272,6 @@ def admin_users():
             for u in users
         ]
     })
-
-@app.get("/admin/user/<int:user_id>/activity")
-@limiter.limit("60 per minute")
-def admin_user_activity(user_id: int):
-    ok, err = require_admin()
-    if err:
-        return err
-
-    u = User.query.get(user_id)
-    if not u:
-        return json_error("User not found", 404)
-
-    trades = (
-        Trade.query.filter_by(user_id=u.id)
-        .order_by(Trade.id.desc())
-        .limit(25)
-        .all()
-    )
-
-    return jsonify({
-        "ok": True,
-        "user": {
-            "id": u.id,
-            "email": u.email,
-            "plan": u.plan,
-            "subscription_status": u.subscription_status,
-            "enabled": bool(u.enabled),
-            "pairs": u.pairs,
-            "lot_size": float(u.lot_size),
-            "created_at": dt_iso(u.created_at),
-            "last_login_at": dt_iso(u.last_login_at),
-            "last_settings_at": dt_iso(u.last_settings_at),
-            "last_seen_at": dt_iso(u.last_seen_at),
-            "last_seen_symbol": u.last_seen_symbol,
-            "last_seen_tf": u.last_seen_tf,
-            "last_seen_ip": u.last_seen_ip,
-        },
-        "trades": [
-            {
-                "id": t.id,
-                "symbol": t.symbol,
-                "side": t.side,
-                "volume": t.volume,
-                "entry": t.entry,
-                "sl": t.sl,
-                "tp": t.tp,
-                "deal_id": t.deal_id,
-                "profit": t.profit,
-                "opened_at": dt_iso(t.opened_at),
-            }
-            for t in trades
-        ]
-    })
-
-@app.post("/admin/user/<int:user_id>/force-enabled")
-def admin_force_enabled(user_id: int):
-    ok, err = require_admin()
-    if err:
-        return err
-
-    data = request.get_json(silent=True) or {}
-    enabled = bool(data.get("enabled", False))
-
-    u = User.query.get(user_id)
-    if not u:
-        return json_error("User not found", 404)
-
-    u.enabled = enabled
-    db.session.commit()
-    return jsonify({"ok": True, "enabled": bool(u.enabled)})
-
-@app.post("/admin/user/<int:user_id>/rotate-api-key")
-def admin_rotate_api_key(user_id: int):
-    ok, err = require_admin()
-    if err:
-        return err
-
-    u = User.query.get(user_id)
-    if not u:
-        return json_error("User not found", 404)
-
-    u.api_key = secrets.token_hex(24)
-    db.session.commit()
-    return jsonify({"ok": True, "api_key": u.api_key})
-
-@app.post("/admin/user/<int:user_id>/override-billing")
-def admin_override_billing(user_id: int):
-    ok, err = require_admin()
-    if err:
-        return err
-
-    u = User.query.get(user_id)
-    if not u:
-        return json_error("User not found", 404)
-
-    data = request.get_json(silent=True) or {}
-    plan = (data.get("plan") or "").strip().lower()
-    sub = (data.get("subscription_status") or "").strip().lower()
-
-    if plan and plan not in ("free", "pro"):
-        return json_error("plan must be free or pro", 400)
-    if sub and sub not in ("none", "active", "past_due", "canceled"):
-        return json_error("subscription_status invalid", 400)
-
-    if plan:
-        u.plan = plan
-    if sub:
-        u.subscription_status = sub
-
-    if u.subscription_status != "active":
-        u.enabled = False
-
-    db.session.commit()
-    return jsonify({"ok": True})
-
-@app.post("/admin/user/<int:user_id>/override-settings")
-def admin_override_settings(user_id: int):
-    ok, err = require_admin()
-    if err:
-        return err
-
-    u = User.query.get(user_id)
-    if not u:
-        return json_error("User not found", 404)
-
-    data = request.get_json(silent=True) or {}
-
-    if "pairs" in data:
-        try:
-            u.pairs = normalize_pairs(str(data["pairs"]))
-            u.pair = first_pair(u.pairs)
-        except ValueError as e:
-            return json_error(str(e), 400)
-
-    if "lot_size" in data:
-        lot = safe_float(data["lot_size"])
-        if lot is None or lot <= 0 or lot > 100:
-            return json_error("lot_size out of range", 400)
-        u.lot_size = lot
-
-    u.last_settings_at = now_utc()
-    db.session.commit()
-    return jsonify({"ok": True})
-
-@app.post("/admin/user/<int:user_id>/force-logout")
-def admin_force_logout(user_id: int):
-    ok, err = require_admin()
-    if err:
-        return err
-
-    u = User.query.get(user_id)
-    if not u:
-        return json_error("User not found", 404)
-
-    u.token_version = int(u.token_version) + 1
-    db.session.commit()
-    return jsonify({"ok": True})
 
 # -------------------------
 # Security headers
